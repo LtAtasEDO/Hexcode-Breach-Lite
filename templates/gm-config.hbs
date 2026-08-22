@@ -1,0 +1,200 @@
+<form class="hbl-wrap hbl-gm-wrap">
+  <header class="hbl-header">
+    <div>
+      <h2>HEXCODE BREACH LITE</h2>
+      <p>Build a scene breach, customize each daemon, then open it for the Netrunner.</p>
+      <p class="hbl-scene-line"><i class="fas fa-map"></i> Scene-local storage: <b>{{sceneName}}</b>. The live binding count is shown in the Tile Binding panel below.</p>
+    </div>
+    <button type="button" data-action="new"><i class="fas fa-file"></i> New Puzzle</button>
+  </header>
+
+  <section class="hbl-grid-2 hbl-top-config">
+    <div class="hbl-panel">
+      <label>Scene Breach Library</label>
+      <select data-action="load">
+        <option value="">— New / Unsaved —</option>
+        {{#each puzzles}}
+          <option value="{{this.id}}" {{#if (eq this.id ../puzzle.id)}}selected{{/if}}>{{this.name}}</option>
+        {{/each}}
+      </select>
+      <div class="hbl-library-actions">
+        <button type="button" data-action="save"><i class="fas fa-save"></i> Save Puzzle</button>
+        <button type="button" class="hbl-danger" data-action="delete" {{#unless hasSavedPuzzle}}disabled{{/unless}}><i class="fas fa-trash"></i> Delete Loaded Puzzle</button>
+      </div>
+      <p class="hbl-help">Each saved breach exists only on <b>{{sceneName}}</b>.</p>
+    </div>
+
+    <div class="hbl-panel hbl-template-panel">
+      <label>Network Template</label>
+      <div class="hbl-inline-control">
+        <select name="templateKey">
+          <option value="custom">Custom / Current</option>
+          {{#each templates}}
+            <option value="{{this.key}}" {{#if (eq this.key ../puzzle.templateKey)}}selected{{/if}}>{{this.label}}</option>
+          {{/each}}
+        </select>
+        <button type="button" data-action="apply-template">Apply</button>
+      </div>
+      <p class="hbl-help">Templates set grid, buffer, timer, and sequence names. Custom / Current supports grids from 4×4 through 8×8 and buffers from 4 through 14.</p>
+    </div>
+  </section>
+
+  <section class="hbl-grid-2">
+    <div class="hbl-panel">
+      <label>Breach Name</label>
+      <input name="name" type="text" value="{{puzzle.name}}" />
+
+      <div class="hbl-mini-grid">
+        <label>Grid Size (4–8) <input name="gridSize" type="number" min="4" max="8" step="1" value="{{puzzle.gridSize}}" /></label>
+        <label>Buffer (4–14) <input name="bufferSize" type="number" min="4" max="14" step="1" value="{{puzzle.bufferSize}}" /></label>
+        <label>Timer <input name="timerSeconds" type="number" min="0" max="600" value="{{puzzle.timerSeconds}}" /></label>
+      </div>
+
+      <label class="hbl-check"><input name="publicProgress" type="checkbox" {{#if puzzle.publicProgress}}checked{{/if}} /> Public chat progress</label>
+
+      <label>Hex Pool <span class="hbl-derived-label">Derived from Sequences</span></label>
+      <input name="hexPool" type="hidden" value="{{hexPoolValue}}" />
+      <div class="hbl-hex-pool hbl-hex-pool-derived">
+        {{#each hexChoices}}
+          <span class="hbl-hex-toggle hbl-hex-pool-display {{#if this.active}}active{{/if}}">{{this.value}}</span>
+        {{/each}}
+      </div>
+      <p class="hbl-help">The sequence buttons below control this pool. Changing a sequence updates the pool and rebuilds the matrix immediately.</p>
+    </div>
+
+    <div class="hbl-panel">
+      <label>Matrix Preview</label>
+      <div class="hbl-matrix-preview">
+        {{#each puzzle.matrix as |row r|}}
+          <div class="hbl-preview-row">
+            {{#each row as |cell c|}}<span>{{cell}}</span>{{/each}}
+          </div>
+        {{/each}}
+      </div>
+    </div>
+  </section>
+
+  <section class="hbl-panel hbl-sequence-editor">
+    <div class="hbl-section-heading">
+      <div>
+        <label>Hexcode Sequences & Rewards</label>
+        <p class="hbl-help">One cracked sequence is a successful breach. Delete any unwanted sequence with its red trash button.</p>
+      </div>
+      <button type="button" data-action="add-sequence"><i class="fas fa-plus"></i> Add Sequence</button>
+    </div>
+
+    <input type="hidden" name="sequenceCount" value="{{sequenceRows.length}}" />
+
+    <div class="hbl-sequence-list">
+      {{#each sequenceRows as |seq|}}
+        <article class="hbl-sequence-row">
+          <input type="hidden" name="sequences.{{seq.index}}.id" value="{{seq.id}}" />
+          <input type="hidden" name="sequences.{{seq.index}}.rewardName" value="{{seq.rewardName}}" />
+          <input type="hidden" name="sequences.{{seq.index}}.rollTableName" value="{{seq.rollTableName}}" />
+
+          <div class="hbl-sequence-title">
+            <span class="hbl-sequence-number">{{seq.displayIndex}}</span>
+            <label>Sequence Name
+              <input name="sequences.{{seq.index}}.label" type="text" value="{{seq.label}}" />
+            </label>
+            <button type="button" class="hbl-danger" data-action="remove-sequence" data-index="{{seq.index}}" data-sequence-id="{{seq.id}}" title="{{#if seq.canDeleteSequence}}Delete this breach sequence{{else}}A breach must retain at least one sequence{{/if}}" {{#unless seq.canDeleteSequence}}disabled{{/unless}}><i class="fas fa-trash"></i></button>
+          </div>
+
+          <div class="hbl-sequence-code-builder">
+            <label>Hexcode Sequence</label>
+            <input name="sequences.{{seq.index}}.code" type="hidden" value="{{seq.codeText}}" />
+            <div class="hbl-sequence-hex-palette">
+              {{#each seq.codeChoices as |hex|}}
+                <button type="button"
+                        class="hbl-sequence-hex-toggle {{#if hex.count}}active{{/if}}"
+                        data-action="append-sequence-hex"
+                        data-index="{{hex.sequenceIndex}}"
+                        data-hex="{{hex.value}}"
+                        title="Append another {{hex.value}} to this sequence">
+                  <span>{{hex.value}}</span>
+                  {{#if hex.count}}<small>×{{hex.count}}</small>{{/if}}
+                </button>
+              {{/each}}
+            </div>
+            <div class="hbl-sequence-token-row" aria-label="Current sequence order">
+              {{#each seq.codeTokens as |token|}}
+                <button type="button"
+                        class="hbl-sequence-token"
+                        data-action="remove-sequence-hex"
+                        data-index="{{token.sequenceIndex}}"
+                        data-position="{{token.position}}"
+                        title="Remove this {{token.value}} at position {{token.displayPosition}}">
+                  <small>{{token.displayPosition}}</small><span>{{token.value}}</span><i class="fas fa-trash-alt"></i>
+                </button>
+              {{/each}}
+            </div>
+            <p class="hbl-sequence-order"><b>Order:</b> {{seq.codeDisplay}}</p>
+            <p class="hbl-help">Click any hexcode above to append it, including repeats. Click an ordered code chip to remove that specific occurrence.</p>
+          </div>
+
+          <div class="hbl-reward-grid-v3">
+            <label>Eurobucks
+              <input name="sequences.{{seq.index}}.eurobucks" type="number" min="0" step="1" value="{{seq.eurobucks}}" />
+            </label>
+
+            <div class="hbl-reward-editor">
+              <label>Item Reward</label>
+              <div class="hbl-document-drop" data-kind="item" data-index="{{seq.index}}">
+                <i class="fas fa-box-open"></i>
+                <span><b>{{seq.rewardDisplay}}</b><small>Drop an Item from the sidebar or a compendium.</small></span>
+              </div>
+              <div class="hbl-payload-readout {{#if seq.rewardLoaded}}loaded{{/if}}">
+                <i class="fas {{#if seq.rewardLoaded}}fa-check-circle{{else}}fa-circle{{/if}}"></i>
+                <input type="text" value="{{seq.rewardFieldDisplay}}" placeholder="No Item reward loaded" readonly />
+              </div>
+              <input name="sequences.{{seq.index}}.rewardUuid" type="text" value="{{seq.rewardUuid}}" placeholder="Paste an Item UUID manually (optional)" title="Saved Item UUID used when this sequence is cracked" />
+              <div class="hbl-picker-actions">
+                <button type="button" data-action="browse-item" data-index="{{seq.index}}"><i class="fas fa-search"></i> Browse Items</button>
+                <button type="button" class="hbl-danger" data-action="clear-item" data-index="{{seq.index}}"><i class="fas fa-trash"></i> Clear</button>
+              </div>
+            </div>
+
+            <div class="hbl-reward-editor">
+              <label>Data RollTable</label>
+              <div class="hbl-document-drop" data-kind="table" data-index="{{seq.index}}">
+                <i class="fas fa-list-ol"></i>
+                <span><b>{{seq.tableDisplay}}</b><small>Drop a RollTable from the sidebar or a compendium.</small></span>
+              </div>
+              <div class="hbl-payload-readout {{#if seq.tableLoaded}}loaded{{/if}}">
+                <i class="fas {{#if seq.tableLoaded}}fa-check-circle{{else}}fa-circle{{/if}}"></i>
+                <input type="text" value="{{seq.tableFieldDisplay}}" placeholder="No Data RollTable loaded" readonly />
+              </div>
+              <input name="sequences.{{seq.index}}.rollTableRef" type="text" value="{{seq.rollTableRef}}" placeholder="UUID, name, or pack::name" title="Saved RollTable reference drawn when this sequence is cracked" />
+              <div class="hbl-picker-actions hbl-picker-actions-three">
+                <button type="button" data-action="browse-table" data-index="{{seq.index}}"><i class="fas fa-search"></i> Browse Tables</button>
+                <button type="button" data-action="test-table" data-index="{{seq.index}}"><i class="fas fa-dice"></i> Test</button>
+                <button type="button" class="hbl-danger" data-action="clear-table" data-index="{{seq.index}}"><i class="fas fa-trash"></i> Clear</button>
+              </div>
+            </div>
+          </div>
+        </article>
+      {{/each}}
+    </div>
+  </section>
+
+  <section class="hbl-panel hbl-binding-panel">
+    <div class="hbl-binding-copy">
+      <label>Scene Tile Binding</label>
+      <p class="hbl-help"><b>{{boundTileCount}}</b> tile(s) on <b>{{sceneName}}</b> are bound to this breach. Select Tiles with Foundry's Tile Controls before binding.</p>
+      <p class="hbl-help">Only an Actor with the <b>Netrunner</b> Role or <b>Interface</b> Role Ability can open a bound breach.</p>
+      <code>{{helperCommand}}</code>
+    </div>
+    <div class="hbl-binding-actions">
+      <button type="button" data-action="bind-tile"><i class="fas fa-link"></i> Bind Selected Tile</button>
+      <button type="button" data-action="unbind-tile"><i class="fas fa-unlink"></i> Unbind Selected</button>
+      <button type="button" data-action="create-helper"><img class="hbl-button-icon" src="systems/cyberpunk-red-core/icons/compendium/gear/computer.svg" alt=""> Create Helper Macro</button>
+    </div>
+  </section>
+
+  <footer class="hbl-footer">
+    <button type="button" data-action="rebuild"><i class="fas fa-random"></i> Rebuild Grid</button>
+    <button type="button" data-action="save"><i class="fas fa-save"></i> Save to Scene</button>
+    <button type="button" data-action="open-player"><i class="fas fa-desktop"></i> Save + GM Preview</button>
+    <button type="button" class="hbl-danger" data-action="delete" {{#unless hasSavedPuzzle}}disabled{{/unless}}><i class="fas fa-trash"></i> Delete Puzzle</button>
+  </footer>
+</form>

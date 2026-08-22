@@ -1,0 +1,25 @@
+{
+  "id": "hexcode-breach-lite",
+  "title": "Hexcode Breach Lite",
+  "description": "A lightweight Cyberpunk-style hexcode breach minigame for Foundry VTT v12 and Cyberpunk RED v0.92.1. Stable v1.0.4 updates the generated helper Macro and GM Create Helper Macro control to use the valid Cyberpunk RED computer icon, while preserving the v1.0.3 Monk's Active Tile Triggers helper repair, scene-local puzzle libraries, strict Netrunner access, customizable 4x4–8x8 grids and 4–14-slot buffers, repeatable hexcodes, audited emergency resets, and Eurobucks, Item, and RollTable rewards.",
+  "version": "1.0.4",
+  "compatibility": {
+    "minimum": "12",
+    "verified": "12.343"
+  },
+  "authors": [
+    {
+      "name": "Lt Atlas"
+    }
+  ],
+  "esmodules": [
+    "scripts/hexcode-breach-lite.js"
+  ],
+  "styles": [
+    "styles/hexcode-breach-lite.css"
+  ],
+  "packs": [],
+  "url": "",
+  "manifest": "",
+  "download": ""
+}

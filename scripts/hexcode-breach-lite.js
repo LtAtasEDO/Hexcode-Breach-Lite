@@ -1,0 +1,1574 @@
+const HBL_ID = "hexcode-breach-lite";
+const HBL_FLAG_PUZZLES = "puzzles";
+const HBL_FLAG_BINDING = "binding";
+const HBL_ROLE_DENIAL_COOLDOWN = 4000;
+
+function hblClone(obj) {
+  return foundry.utils.deepClone(obj);
+}
+
+function hblRandomId() {
+  return foundry.utils.randomID(12);
+}
+
+function hblEsc(s = "") {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function hblNumber(value, fallback = 0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function hblGetForm(html) {
+  const root = html?.[0] ?? html ?? null;
+  if (root?.tagName === "FORM") return root;
+  const form = root?.querySelector?.("form") ?? null;
+  return form?.tagName === "FORM" ? form : null;
+}
+
+const HBL = {
+  DEFAULT_HEX: ["1C", "55", "BD", "E9", "7A", "FF"],
+  roleDenialCache: new Map(),
+
+  documentReference(doc) {
+    if (!doc) return "";
+    if (doc.uuid) return String(doc.uuid);
+    if (doc.pack && doc.id) return `Compendium.${doc.pack}.${doc.documentName}.${doc.id}`;
+    if (doc.documentName && doc.id) return `${doc.documentName}.${doc.id}`;
+    return "";
+  },
+
+  async resolvePayloadNames(puzzle) {
+    puzzle = this.normalizePuzzle(puzzle);
+    for (const sequence of puzzle.sequences) {
+      if (sequence.rewardUuid && !sequence.rewardName) {
+        try {
+          const item = await fromUuid(sequence.rewardUuid);
+          if (item?.documentName === "Item") sequence.rewardName = item.name;
+        } catch (_err) {
+          // Keep the stable UUID/reference even when the source document is unavailable.
+        }
+      }
+      if (sequence.rollTableRef && !sequence.rollTableName) {
+        try {
+          const table = await this.resolveRollTable(sequence.rollTableRef);
+          if (table) sequence.rollTableName = table.name;
+        } catch (_err) {
+          // Keep the stable RollTable reference even when it cannot currently resolve.
+        }
+      }
+    }
+    return puzzle;
+  },
+
+  TEMPLATES: {
+    quick: {
+      label: "Quick Access",
+      description: "Compact access point or cheap consumer device.",
+      gridSize: 4,
+      bufferSize: 4,
+      timerSeconds: 45,
+      sequences: [
+        { label: "Access Granted", code: ["1C", "55"] },
+        { label: "Local Data Cache", code: ["BD", "E9", "7A"] }
+      ]
+    },
+    standard: {
+      label: "Standard Network",
+      description: "General-purpose network breach with three daemons.",
+      gridSize: 5,
+      bufferSize: 6,
+      timerSeconds: 60,
+      sequences: [
+        { label: "Basic Access", code: ["1C", "55"] },
+        { label: "Camera Loop", code: ["BD", "E9", "7A"] },
+        { label: "Daemon Upload", code: ["FF", "1C", "BD"] }
+      ]
+    },
+    corporate: {
+      label: "Corporate Security",
+      description: "Hardened office, lab, or secured corporate subnet.",
+      gridSize: 6,
+      bufferSize: 7,
+      timerSeconds: 75,
+      sequences: [
+        { label: "Credential Spoof", code: ["55", "1C", "BD"] },
+        { label: "Security Control", code: ["E9", "7A", "55"] },
+        { label: "Encrypted Datastore", code: ["FF", "BD", "1C", "E9"] }
+      ]
+    },
+    blackIce: {
+      label: "Black ICE Vault",
+      description: "High-threat vault or protected black-file datastore.",
+      gridSize: 7,
+      bufferSize: 8,
+      timerSeconds: 90,
+      sequences: [
+        { label: "ICE Suppression", code: ["BD", "E9", "55"] },
+        { label: "Root Override", code: ["FF", "1C", "7A", "BD"] },
+        { label: "Black File Extraction", code: ["7A", "55", "E9", "1C", "FF"] }
+      ]
+    }
+  },
+
+  newSequence(data = {}) {
+    return {
+      id: data.id || hblRandomId(),
+      label: String(data.label || "New Sequence"),
+      code: this.normalizeSequenceCode(data.code || []),
+      eurobucks: Math.max(0, Math.trunc(hblNumber(data.eurobucks, 0))),
+      rewardUuid: String(data.rewardUuid || ""),
+      rewardName: String(data.rewardName || ""),
+      rollTableRef: String(data.rollTableRef || data.rollTable || ""),
+      rollTableName: String(data.rollTableName || ""),
+      solved: Boolean(data.solved),
+      rewardGranted: Boolean(data.rewardGranted)
+    };
+  },
+
+  defaultPuzzle() {
+    return this.puzzleFromTemplate("standard", {
+      id: hblRandomId(),
+      name: "New Hexcode Breach",
+      publicProgress: true,
+      createdAt: Date.now()
+    });
+  },
+
+  puzzleFromTemplate(templateKey = "standard", overrides = {}) {
+    const template = this.TEMPLATES[templateKey] || this.TEMPLATES.standard;
+    const sequences = template.sequences.map(sequence => this.newSequence(sequence));
+    const hexPool = this.deriveHexPool(sequences);
+    const puzzle = {
+      id: overrides.id || hblRandomId(),
+      name: overrides.name || template.label,
+      templateKey,
+      gridSize: template.gridSize,
+      bufferSize: template.bufferSize,
+      timerSeconds: template.timerSeconds,
+      publicProgress: overrides.publicProgress ?? true,
+      hexPool,
+      matrix: [],
+      sequences,
+      status: "ready",
+      createdAt: overrides.createdAt || Date.now(),
+      updatedAt: Date.now()
+    };
+    puzzle.matrix = this.generateMatrix(puzzle.gridSize, puzzle.hexPool);
+    return puzzle;
+  },
+
+  normalizePuzzle(raw) {
+    const base = raw ? hblClone(raw) : this.defaultPuzzle();
+    base.id ||= hblRandomId();
+    base.name ||= "Hexcode Breach";
+    base.templateKey ||= "custom";
+    base.gridSize = Math.clamp(hblNumber(base.gridSize, 5), 4, 8);
+    base.bufferSize = Math.clamp(hblNumber(base.bufferSize, 6), 4, 14);
+    base.timerSeconds = Math.clamp(hblNumber(base.timerSeconds, 60), 0, 600);
+    base.publicProgress = base.publicProgress !== false;
+    const storedPool = this.normalizeHexPool(base.hexPool);
+    base.sequences = Array.isArray(base.sequences)
+      ? base.sequences.map(sequence => this.newSequence(sequence)).filter(sequence => sequence.code.length)
+      : [];
+    if (!base.sequences.length) {
+      base.sequences = this.TEMPLATES.standard.sequences.map(sequence => this.newSequence(sequence));
+    }
+
+    base.hexPool = this.deriveHexPool(base.sequences);
+    const poolChanged = storedPool.join("|") !== base.hexPool.join("|");
+
+    if (
+      poolChanged
+      || !Array.isArray(base.matrix)
+      || base.matrix.length !== base.gridSize
+      || base.matrix.some(row => !Array.isArray(row) || row.length !== base.gridSize)
+      || base.matrix.some(row => row.some(value => !base.hexPool.includes(value)))
+    ) {
+      base.matrix = this.generateMatrix(base.gridSize, base.hexPool);
+    }
+    return base;
+  },
+
+  normalizeSequenceCode(value) {
+    const values = Array.isArray(value)
+      ? value
+      : this.parseCode(value || "");
+    return values
+      .map(entry => String(entry).trim().toUpperCase())
+      .filter(entry => this.DEFAULT_HEX.includes(entry));
+  },
+
+  deriveHexPool(sequences = []) {
+    const used = new Set(
+      (Array.isArray(sequences) ? sequences : [])
+        .flatMap(sequence => this.normalizeSequenceCode(sequence?.code || []))
+    );
+    const pool = this.DEFAULT_HEX.filter(entry => used.has(entry));
+    return pool.length ? pool : hblClone(this.DEFAULT_HEX);
+  },
+
+  normalizeHexPool(value) {
+    const values = Array.isArray(value)
+      ? value
+      : String(value || "").split(/[\s,;]+/);
+    const pool = [...new Set(values
+      .map(entry => String(entry).trim().toUpperCase())
+      .filter(entry => this.DEFAULT_HEX.includes(entry)))];
+    return pool.length ? this.DEFAULT_HEX.filter(entry => pool.includes(entry)) : hblClone(this.DEFAULT_HEX);
+  },
+
+  parseCode(text) {
+    return String(text || "")
+      .split(/[\s,;>-]+/)
+      .map(entry => entry.trim().toUpperCase())
+      .filter(entry => this.DEFAULT_HEX.includes(entry));
+  },
+
+  generateMatrix(size = 5, pool = this.DEFAULT_HEX) {
+    size = Math.clamp(Number(size) || 5, 3, 8);
+    const cleanPool = this.normalizeHexPool(pool);
+    return Array.from({ length: size }, () =>
+      Array.from({ length: size }, () => cleanPool[Math.floor(Math.random() * cleanPool.length)])
+    );
+  },
+
+  getScene() {
+    return canvas?.scene ?? game.scenes?.active ?? game.scenes?.current ?? null;
+  },
+
+  getControlledTileDocuments() {
+    const controlled = canvas?.tiles?.controlled ?? [];
+    return controlled
+      .map(tile => tile?.document ?? tile)
+      .filter(tile => tile?.documentName === "Tile");
+  },
+
+  getTileBinding(tile) {
+    const doc = tile?.document ?? tile;
+    return doc?.documentName === "Tile" ? hblClone(doc.getFlag(HBL_ID, HBL_FLAG_BINDING) || null) : null;
+  },
+
+  getBoundTileCount(puzzleId) {
+    const scene = this.getScene();
+    if (!scene || !puzzleId) return 0;
+    return scene.tiles.filter(tile => {
+      const binding = tile.getFlag(HBL_ID, HBL_FLAG_BINDING);
+      return binding?.sceneId === scene.id && binding?.puzzleId === puzzleId;
+    }).length;
+  },
+
+  async bindSelectedTiles(puzzle) {
+    const scene = this.getScene();
+    if (!game.user.isGM) return ui.notifications.warn("Only the GM can bind Hexcode Breach tiles.");
+    if (!scene) return ui.notifications.error("No active scene found for Hexcode Breach Lite.");
+    const tiles = this.getControlledTileDocuments();
+    if (!tiles.length) {
+      return ui.notifications.warn("Select one or more Tiles with Foundry's Tile Controls, then press Bind Selected Tile.");
+    }
+    puzzle = this.normalizePuzzle(puzzle);
+    const binding = {
+      sceneId: scene.id,
+      puzzleId: puzzle.id,
+      puzzleName: puzzle.name,
+      boundAt: Date.now(),
+      version: 2
+    };
+    await Promise.all(tiles.map(tile => tile.setFlag(HBL_ID, HBL_FLAG_BINDING, binding)));
+    ui.notifications.info(`Bound ${tiles.length} tile${tiles.length === 1 ? "" : "s"} to ${puzzle.name} on ${scene.name}.`);
+    return tiles.length;
+  },
+
+  async unbindSelectedTiles() {
+    if (!game.user.isGM) return ui.notifications.warn("Only the GM can unbind Hexcode Breach tiles.");
+    const tiles = this.getControlledTileDocuments();
+    if (!tiles.length) {
+      return ui.notifications.warn("Select one or more Tiles with Foundry's Tile Controls, then press Unbind Selected.");
+    }
+    await Promise.all(tiles.map(tile => tile.unsetFlag(HBL_ID, HBL_FLAG_BINDING)));
+    ui.notifications.info(`Removed Hexcode Breach binding from ${tiles.length} tile${tiles.length === 1 ? "" : "s"}.`);
+    return tiles.length;
+  },
+
+  async resolveTileDocument(value) {
+    if (!value) return null;
+    if (value.documentName === "Tile") return value;
+    if (value.document?.documentName === "Tile") return value.document;
+    if (value.object?.documentName === "Tile") return value.object;
+    if (value.object?.document?.documentName === "Tile") return value.object.document;
+
+    const possibleUuid = typeof value === "string" ? value : value.uuid;
+    if (possibleUuid) {
+      try {
+        const doc = await fromUuid(possibleUuid);
+        if (doc?.documentName === "Tile") return doc;
+      } catch (_err) {
+        // Continue to scene-local ID resolution.
+      }
+    }
+
+    const possibleId = typeof value === "string" ? value : (value.id ?? value._id);
+    if (possibleId) {
+      const local = this.getScene()?.tiles?.get(possibleId);
+      if (local?.documentName === "Tile") return local;
+    }
+    return null;
+  },
+
+  async findTriggerTile(args) {
+    const queue = Array.isArray(args) ? [...args] : [args];
+    const seen = new Set();
+    const nestedKeys = [
+      "tile", "tileDocument", "triggeringTile", "sourceTile",
+      "origin", "document", "entity", "object",
+      "action", "value", "args", "context"
+    ];
+
+    while (queue.length) {
+      const candidate = queue.shift();
+      if (!candidate) continue;
+
+      if (Array.isArray(candidate)) {
+        queue.unshift(...candidate);
+        continue;
+      }
+
+      if (typeof candidate === "object") {
+        if (seen.has(candidate)) continue;
+        seen.add(candidate);
+      }
+
+      const tile = await this.resolveTileDocument(candidate);
+      if (tile) return tile;
+
+      if (typeof candidate === "object") {
+        for (const key of nestedKeys) {
+          if (candidate[key] != null) queue.push(candidate[key]);
+        }
+      }
+    }
+
+    // GM convenience only: a manually controlled Tile can still be resolved when
+    // testing the helper outside Monk's Active Tile Triggers.
+    return this.getControlledTileDocuments()[0] ?? null;
+  },
+
+  async resolveActorDocument(value) {
+    if (!value) return null;
+    if (value.documentName === "Actor") return value;
+    if (value.actor?.documentName === "Actor") return value.actor;
+    if (value.document?.actor?.documentName === "Actor") return value.document.actor;
+    if (value.object?.actor?.documentName === "Actor") return value.object.actor;
+    if (value.token?.actor?.documentName === "Actor") return value.token.actor;
+
+    const possibleUuid = typeof value === "string" ? value : value.uuid;
+    if (possibleUuid) {
+      try {
+        const doc = await fromUuid(possibleUuid);
+        if (doc?.documentName === "Actor") return doc;
+        if (doc?.actor?.documentName === "Actor") return doc.actor;
+      } catch (_err) {
+        // Continue through local IDs.
+      }
+    }
+
+    const possibleId = typeof value === "string" ? value : (value.id ?? value._id);
+    if (possibleId) {
+      const actor = game.actors?.get(possibleId);
+      if (actor) return actor;
+      const token = this.getScene()?.tokens?.get(possibleId);
+      if (token?.actor) return token.actor;
+    }
+    return null;
+  },
+
+  async findTriggerActor(args, { allowUserFallback = true } = {}) {
+    const queue = Array.isArray(args) ? [...args] : [args];
+    const seen = new Set();
+    const nestedKeys = [
+      "actor", "actorUuid", "actorId",
+      "token", "tokenUuid", "tokenId", "tokenDocument",
+      "triggeringToken", "triggeringTokens", "sourceToken",
+      "tokens", "selectedTokens", "entities", "entity",
+      "document", "object", "action", "value", "args"
+    ];
+
+    while (queue.length) {
+      const candidate = queue.shift();
+      if (!candidate) continue;
+
+      if (Array.isArray(candidate)) {
+        queue.unshift(...candidate);
+        continue;
+      }
+
+      if (typeof candidate === "object") {
+        if (seen.has(candidate)) continue;
+        seen.add(candidate);
+      }
+
+      const actor = await this.resolveActorDocument(candidate);
+      if (actor) return actor;
+
+      if (typeof candidate === "object") {
+        for (const key of nestedKeys) {
+          if (candidate[key] != null) queue.push(candidate[key]);
+        }
+      }
+    }
+
+    return allowUserFallback ? this.getUserActor() : null;
+  },
+
+  isNetrunner(actor) {
+    if (!actor) return false;
+    return actor.items?.some(item => {
+      if (item.type !== "role") return false;
+      const roleName = String(item.name || "").trim().toLowerCase();
+      const mainAbility = String(item.system?.mainRoleAbility || "").trim().toLowerCase();
+      return roleName === "netrunner" || mainAbility === "interface";
+    }) ?? false;
+  },
+
+  getRoleNames(actor) {
+    if (!actor) return [];
+    return actor.items
+      ?.filter(item => item.type === "role")
+      .map(item => item.name)
+      .filter(Boolean) ?? [];
+  },
+
+  async postRoleDenied(actor, puzzle = null, reason = "") {
+    const actorName = actor?.name || "Unverified operator";
+    const key = `${game.user.id}:${actor?.id || "none"}:${this.getScene()?.id || "none"}:${reason}`;
+    const now = Date.now();
+    if ((this.roleDenialCache.get(key) || 0) + HBL_ROLE_DENIAL_COOLDOWN > now) return;
+    this.roleDenialCache.set(key, now);
+
+    const roles = this.getRoleNames(actor);
+    const roleText = roles.length ? ` Current Role: ${roles.join(", ")}.` : "";
+    const denialText = reason || `${actorName} is not a Netrunner.`;
+    ui.notifications.warn(reason || "Hexcode Breach requires a Netrunner.");
+    return ChatMessage.create({
+      speaker: ChatMessage.getSpeaker({ actor }),
+      content: `<div class="hbl-chat-card"><h3>${hblEsc(puzzle?.name || "Hexcode Breach")}</h3><p class="hbl-fail"><b>ACCESS DENIED:</b> ${hblEsc(denialText)}</p><p>This live interface only responds to an Actor with the Netrunner Role or Interface Role Ability.${hblEsc(roleText)}</p></div>`
+    });
+  },
+
+  async openPuzzle(puzzleId = null, options = {}) {
+    const actor = options.actor ?? await this.resolveActorDocument(options.actorUuid) ?? this.getUserActor();
+    if (!this.isNetrunner(actor)) {
+      const puzzle = puzzleId ? await this.getPuzzle(puzzleId) : null;
+      await this.postRoleDenied(actor, puzzle);
+      return null;
+    }
+    return new HBLPlayerApp({ puzzleId, actor, gmPreview: false }).render(true);
+  },
+
+  async openBoundTile(args = null) {
+    const scene = this.getScene();
+    if (!scene) return ui.notifications.error("No active scene found for Hexcode Breach Lite.");
+    const tile = await this.findTriggerTile(args);
+    if (!tile) return ui.notifications.warn("Hexcode Breach could not identify the triggering tile.");
+    const binding = this.getTileBinding(tile);
+    if (!binding?.puzzleId) return ui.notifications.warn("This tile is not bound to a Hexcode Breach puzzle.");
+    if (binding.sceneId && binding.sceneId !== scene.id) {
+      return ui.notifications.warn("This Hexcode Breach tile belongs to a different scene.");
+    }
+    const puzzle = await this.getPuzzle(binding.puzzleId);
+    if (!puzzle) {
+      return ui.notifications.warn(`Bound breach not found on ${scene.name}: ${binding.puzzleName || binding.puzzleId}`);
+    }
+
+    const actor = await this.findTriggerActor(args, { allowUserFallback: false });
+    if (!actor) {
+      await this.postRoleDenied(null, puzzle, "No triggering Actor could be verified from the bound Tile activation.");
+      return null;
+    }
+    if (!this.isNetrunner(actor)) {
+      await this.postRoleDenied(actor, puzzle);
+      return null;
+    }
+    return this.openPuzzle(binding.puzzleId, { actor });
+  },
+
+  async createHelperMacro() {
+    if (!game.user.isGM) return ui.notifications.warn("Only the GM can create the Hexcode Breach helper macro.");
+    const name = "Hexcode Breach — Open Bound Tile";
+    // Monk's Active Tile Triggers v12 supplies tile/token/actor/args to Script Macros.
+    // Match the proven helper style used by the other local modules: call module.api
+    // directly, avoid a global alias dependency, and let MATT/Foundry await the Promise.
+    const command = `const hbl = game.modules.get("hexcode-breach-lite")?.api;
+if (!hbl) return ui.notifications.error("Hexcode Breach Lite API is not available. Confirm the module is enabled, then restart Foundry.");
+return hbl.openBound({
+  args: typeof args === "undefined" ? null : args,
+  tile: typeof tile === "undefined" ? null : tile,
+  token: typeof token === "undefined" ? null : token,
+  actor: typeof actor === "undefined" ? null : actor
+});`;
+    let macro = game.macros.getName(name);
+    try {
+      if (macro) {
+        await macro.update({ type: "script", command, img: "systems/cyberpunk-red-core/icons/compendium/gear/computer.svg" });
+        ui.notifications.info("Repaired the Hexcode Breach tile helper macro for Monk's Active Tile Triggers v12.");
+      } else {
+        macro = await Macro.create({
+          name,
+          type: "script",
+          command,
+          img: "systems/cyberpunk-red-core/icons/compendium/gear/computer.svg"
+        });
+        ui.notifications.info("Created the Hexcode Breach tile helper macro.");
+      }
+    } catch (err) {
+      console.error(`${HBL_ID} | Failed to create/update helper Macro`, err);
+      // A malformed Macro can fail Foundry joint validation before an update can repair it.
+      // Fall back to replacing it with a clean Script Macro. MATT actions that referenced
+      // the old Macro UUID must select the recreated helper once.
+      if (macro) {
+        try {
+          await macro.delete();
+          macro = await Macro.create({
+            name,
+            type: "script",
+            command,
+            img: "systems/cyberpunk-red-core/icons/compendium/gear/computer.svg"
+          });
+          ui.notifications.warn("Recreated the Hexcode Breach helper Macro because the old copy was invalid. Re-select it once in existing Monk's Run Macro actions.");
+          return macro;
+        } catch (replaceErr) {
+          console.error(`${HBL_ID} | Failed to replace malformed helper Macro`, replaceErr);
+        }
+      }
+      ui.notifications.error("Foundry rejected the Hexcode Breach helper Macro. Delete 'Hexcode Breach — Open Bound Tile' and press Create Helper Macro again.");
+      return null;
+    }
+    return macro;
+  },
+
+  async getScenePuzzles() {
+    const scene = this.getScene();
+    if (!scene) return {};
+    const stored = hblClone(scene.getFlag(HBL_ID, HBL_FLAG_PUZZLES) || {});
+    return Object.fromEntries(Object.entries(stored).map(([id, puzzle]) => [id, this.normalizePuzzle(puzzle)]));
+  },
+
+  async replaceScenePuzzles(puzzles = {}) {
+    const scene = this.getScene();
+    if (!scene) return false;
+    // Foundry document updates merge nested objects. Unsetting first prevents deleted
+    // puzzle IDs from surviving as ghost keys in scene flags.
+    await scene.unsetFlag(HBL_ID, HBL_FLAG_PUZZLES);
+    if (Object.keys(puzzles).length) {
+      await scene.setFlag(HBL_ID, HBL_FLAG_PUZZLES, hblClone(puzzles));
+    }
+    return true;
+  },
+
+  async getPuzzle(id) {
+    const puzzles = await this.getScenePuzzles();
+    return puzzles[id] ? hblClone(puzzles[id]) : null;
+  },
+
+  async savePuzzle(puzzle) {
+    const scene = this.getScene();
+    if (!scene) return ui.notifications.error("No active scene found for Hexcode Breach Lite.");
+    if (!game.user.isGM) return ui.notifications.warn("Only the GM can save breach puzzles.");
+    puzzle = await this.resolvePayloadNames(puzzle);
+    puzzle.id ||= hblRandomId();
+    puzzle.updatedAt = Date.now();
+    const puzzles = await this.getScenePuzzles();
+    puzzles[puzzle.id] = hblClone(puzzle);
+    await this.replaceScenePuzzles(puzzles);
+    ui.notifications.info(`Saved breach: ${puzzle.name}`);
+    return puzzle;
+  },
+
+  async deletePuzzle(id) {
+    const scene = this.getScene();
+    if (!scene || !game.user.isGM || !id) return { ok: false, removedBindings: 0 };
+    const puzzles = await this.getScenePuzzles();
+    const existing = puzzles[id] ?? null;
+    const name = existing?.name || "Hexcode Breach";
+    delete puzzles[id];
+    await this.replaceScenePuzzles(puzzles);
+
+    const boundTiles = scene.tiles.filter(tile => {
+      const binding = tile.getFlag(HBL_ID, HBL_FLAG_BINDING);
+      return binding?.puzzleId === id;
+    });
+    await Promise.all(boundTiles.map(tile => tile.unsetFlag(HBL_ID, HBL_FLAG_BINDING)));
+
+    const verifyPuzzles = await this.getScenePuzzles();
+    const stillExists = Boolean(verifyPuzzles[id]);
+    const remainingBindings = scene.tiles.filter(tile => tile.getFlag(HBL_ID, HBL_FLAG_BINDING)?.puzzleId === id);
+    if (stillExists || remainingBindings.length) {
+      console.error(`${HBL_ID} | Puzzle deletion verification failed`, { id, stillExists, remainingBindings });
+      ui.notifications.error(`Could not fully delete ${name}. Check the F12 console.`);
+      return { ok: false, removedBindings: boundTiles.length };
+    }
+
+    ui.notifications.info(`Deleted ${name}${boundTiles.length ? ` and removed ${boundTiles.length} tile binding${boundTiles.length === 1 ? "" : "s"}` : ""}.`);
+    return { ok: true, removedBindings: boundTiles.length };
+  },
+
+  async postProgress(puzzle, html, { force = false, speaker = null } = {}) {
+    if (!force && !puzzle.publicProgress) return;
+    return ChatMessage.create({
+      speaker: speaker ?? ChatMessage.getSpeaker(),
+      content: `<div class="hbl-chat-card"><h3>${hblEsc(puzzle.name)}</h3>${html}</div>`
+    });
+  },
+
+  getUserActor() {
+    const token = canvas?.tokens?.controlled?.[0];
+    if (token?.actor) return token.actor;
+    return game.user.character ?? null;
+  },
+
+  async awardItem(actor, rewardUuid) {
+    if (!rewardUuid) return null;
+    if (!actor) return { ok: false, text: "Item reward could not be awarded: no actor selected." };
+    try {
+      if (!actor.isOwner) return { ok: false, text: "Item reward found, but this user cannot update the actor inventory." };
+      const doc = await fromUuid(rewardUuid);
+      if (!doc || doc.documentName !== "Item") throw new Error("UUID did not resolve to an Item.");
+      const itemData = doc.toObject();
+      delete itemData._id;
+      await actor.createEmbeddedDocuments("Item", [itemData]);
+      return { ok: true, text: `Item acquired: ${doc.name}` };
+    } catch (err) {
+      console.warn(`${HBL_ID} | Item reward failed`, err);
+      return { ok: false, text: `Item reward failed: ${rewardUuid}` };
+    }
+  },
+
+  async adjustWealth(actor, delta, reason = "Hexcode Breach Reward") {
+    delta = Math.trunc(hblNumber(delta, 0));
+    if (!delta) return null;
+    if (!actor) return { ok: false, text: "Eurobuck reward could not be awarded: no actor selected." };
+    try {
+      if (!actor.isOwner) return { ok: false, text: "Eurobuck reward found, but this user cannot update the actor ledger." };
+      const wealth = hblClone(actor.system?.wealth ?? {});
+      const before = hblNumber(wealth.value, 0);
+      const after = before + delta;
+      wealth.value = after;
+      wealth.transactions = Array.isArray(wealth.transactions) ? hblClone(wealth.transactions) : [];
+      const sign = delta >= 0 ? "+" : "−";
+      wealth.transactions.push([`${sign}${Math.abs(delta)}eb → ${after}eb`, reason]);
+      await actor.update({ "system.wealth": wealth });
+      return { ok: true, text: `${sign}${Math.abs(delta)}eb transferred to ${actor.name}.` };
+    } catch (err) {
+      console.warn(`${HBL_ID} | Eurobuck reward failed`, err);
+      return { ok: false, text: `Eurobuck reward failed for ${actor.name}.` };
+    }
+  },
+
+  async resolveRollTable(reference) {
+    const ref = String(reference || "").trim();
+    if (!ref) return null;
+
+    try {
+      const byUuid = await fromUuid(ref);
+      if (byUuid?.documentName === "RollTable") return byUuid;
+    } catch (_err) {
+      // Continue through name/pack resolution.
+    }
+
+    if (ref.includes("::")) {
+      const [packRaw, ...nameParts] = ref.split("::");
+      const packKey = packRaw.trim();
+      const tableName = nameParts.join("::").trim();
+      const pack = game.packs.get(packKey)
+        ?? game.packs.find(candidate => candidate.collection === packKey || candidate.metadata?.label === packKey || candidate.title === packKey);
+      if (!pack || pack.documentName !== "RollTable") return null;
+      const index = await pack.getIndex({ fields: ["name"] });
+      const entry = index.find(item => item.name === tableName)
+        ?? index.find(item => item.name?.toLowerCase() === tableName.toLowerCase());
+      return entry ? pack.getDocument(entry._id) : null;
+    }
+
+    return game.tables.get(ref)
+      ?? game.tables.getName(ref)
+      ?? game.tables.find(table => table.name?.toLowerCase() === ref.toLowerCase())
+      ?? null;
+  },
+
+  async drawData(reference) {
+    if (!reference) return null;
+    try {
+      const table = await this.resolveRollTable(reference);
+      if (!table) return { ok: false, tableName: reference, results: [`RollTable not found: ${reference}`] };
+      const draw = await table.roll({ recursive: true });
+      const results = draw?.results ?? draw?.RollTableDraw?.results ?? [];
+      const texts = results.map(result => {
+        try {
+          return result.getChatText?.() || result.text || result.name || "Unknown table result";
+        } catch (_err) {
+          return result.text || result.name || "Unknown table result";
+        }
+      });
+      return { ok: true, tableName: table.name, results: texts.length ? texts : ["No result was drawn."] };
+    } catch (err) {
+      console.warn(`${HBL_ID} | RollTable reward failed`, err);
+      return { ok: false, tableName: reference, results: [`RollTable draw failed: ${reference}`] };
+    }
+  },
+
+  async grantSequenceRewards(actor, sequence, puzzle) {
+    if (sequence.rewardGranted) return "";
+    sequence.rewardGranted = true;
+    const rewards = [];
+
+    const money = await this.adjustWealth(actor, sequence.eurobucks, `Hexcode Breach: ${sequence.label}`);
+    if (money) rewards.push(money);
+
+    const item = await this.awardItem(actor, sequence.rewardUuid);
+    if (item) rewards.push(item);
+
+    const data = await this.drawData(sequence.rollTableRef);
+    if (data) {
+      const results = data.results.map(text => `<li>${text}</li>`).join("");
+      rewards.push({ ok: data.ok, html: `<b>Data acquired — ${hblEsc(data.tableName)}</b><ul>${results}</ul>` });
+    }
+
+    if (!rewards.length) return "";
+    const rows = rewards.map(reward => {
+      if (reward.html) return `<li class="${reward.ok ? "hbl-reward-ok" : "hbl-reward-warn"}">${reward.html}</li>`;
+      return `<li class="${reward.ok ? "hbl-reward-ok" : "hbl-reward-warn"}">${hblEsc(reward.text)}</li>`;
+    }).join("");
+    return `<div class="hbl-chat-rewards"><b>PAYLOAD:</b><ul>${rows}</ul></div>`;
+  },
+
+  async documentFromDrop(event, expectedDocumentName) {
+    const nativeEvent = event?.originalEvent ?? event;
+    let data = null;
+    try {
+      data = TextEditor.getDragEventData(nativeEvent);
+    } catch (err) {
+      console.warn(`${HBL_ID} | Could not parse drag data`, err);
+      return null;
+    }
+    if (!data) return null;
+
+    let doc = null;
+    if (data.uuid) {
+      try {
+        doc = await fromUuid(data.uuid);
+      } catch (_err) {
+        doc = null;
+      }
+    }
+    if (!doc && data.pack && (data.id || data._id)) {
+      doc = await game.packs.get(data.pack)?.getDocument(data.id || data._id);
+    }
+    if (!doc && (data.id || data._id)) {
+      if (expectedDocumentName === "Item") doc = game.items.get(data.id || data._id);
+      if (expectedDocumentName === "RollTable") doc = game.tables.get(data.id || data._id);
+    }
+    return doc?.documentName === expectedDocumentName ? doc : null;
+  },
+
+  openDocumentPicker(documentName, onSelect) {
+    return new HBLDocumentPickerApp({ documentName, onSelect }).render(true);
+  },
+
+  api: {
+    openGM: (id = null) => new HBLGMConfigApp({ puzzleId: id }).render(true),
+    openPuzzle: async (id = null, options = {}) => HBL.openPuzzle(id, options),
+    openBound: async (args = null) => HBL.openBoundTile(args),
+    bindSelectedTiles: async puzzle => HBL.bindSelectedTiles(puzzle),
+    unbindSelectedTiles: async () => HBL.unbindSelectedTiles(),
+    createHelperMacro: async () => HBL.createHelperMacro(),
+    createRandom: async () => HBL.savePuzzle(HBL.defaultPuzzle()),
+    listScenePuzzles: async () => HBL.getScenePuzzles(),
+    resolveRollTable: async reference => HBL.resolveRollTable(reference),
+    isNetrunner: actor => HBL.isNetrunner(actor)
+  }
+};
+
+class HBLDocumentPickerApp extends Application {
+  constructor(options = {}) {
+    super(options);
+    this.documentName = options.documentName;
+    this.onSelect = options.onSelect;
+    this.catalog = null;
+  }
+
+  static get defaultOptions() {
+    return foundry.utils.mergeObject(super.defaultOptions, {
+      id: "hbl-document-picker",
+      title: "Hexcode Reward Browser",
+      template: `modules/${HBL_ID}/templates/document-picker.hbs`,
+      width: 650,
+      height: 620,
+      resizable: true,
+      classes: ["hbl", "hbl-picker"]
+    });
+  }
+
+  async buildCatalog() {
+    if (this.catalog) return this.catalog;
+    const entries = [];
+    const worldCollection = this.documentName === "Item" ? game.items : game.tables;
+    for (const doc of worldCollection) {
+      entries.push({
+        name: doc.name,
+        source: "World",
+        img: doc.img || "icons/svg/d20-black.svg",
+        doc
+      });
+    }
+
+    const packs = game.packs.filter(pack => pack.documentName === this.documentName);
+    for (const pack of packs) {
+      try {
+        const index = await pack.getIndex({ fields: ["name", "img"] });
+        for (const entry of index) {
+          entries.push({
+            name: entry.name,
+            source: pack.metadata?.label || pack.title || pack.collection,
+            img: entry.img || "icons/svg/d20-black.svg",
+            pack: pack.collection,
+            id: entry._id
+          });
+        }
+      } catch (err) {
+        console.warn(`${HBL_ID} | Could not index ${pack.collection}`, err);
+      }
+    }
+    this.catalog = entries.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    return this.catalog;
+  }
+
+  async getData() {
+    await this.buildCatalog();
+    return {
+      label: this.documentName === "Item" ? "Item Reward" : "Data RollTable",
+      placeholder: this.documentName === "Item" ? "Search world Items and Item compendiums…" : "Search world RollTables and RollTable compendiums…",
+      total: this.catalog.length
+    };
+  }
+
+  renderResults(html, query = "") {
+    const needle = String(query || "").trim().toLowerCase();
+    const filtered = this.catalog
+      .map((entry, index) => ({ entry, index }))
+      .filter(({ entry }) => !needle || `${entry.name} ${entry.source}`.toLowerCase().includes(needle))
+      .slice(0, 150);
+
+    const rows = filtered.map(({ entry, index }) => `
+      <button type="button" class="hbl-picker-row" data-action="choose-document" data-index="${index}">
+        <img src="${hblEsc(entry.img)}" alt="" />
+        <span><b>${hblEsc(entry.name)}</b><small>${hblEsc(entry.source)}</small></span>
+        <i class="fas fa-plus"></i>
+      </button>
+    `).join("");
+    html.find(".hbl-picker-results").html(rows || `<p class="hbl-muted">No matching ${hblEsc(this.documentName)} documents found.</p>`);
+    html.find(".hbl-picker-count").text(`${filtered.length} shown / ${this.catalog.length} indexed`);
+  }
+
+  activateListeners(html) {
+    super.activateListeners(html);
+    this.renderResults(html, "");
+    html.find("[name='pickerSearch']").on("input", event => this.renderResults(html, event.currentTarget.value));
+    html.on("click", "[data-action='choose-document']", async event => {
+      const entry = this.catalog[Number(event.currentTarget.dataset.index)];
+      if (!entry) return;
+      let doc = entry.doc ?? null;
+      if (!doc && entry.pack && entry.id) doc = await game.packs.get(entry.pack)?.getDocument(entry.id);
+      if (!doc) return ui.notifications.warn(`${this.documentName} could not be loaded.`);
+      await this.onSelect?.(doc);
+      return this.close();
+    });
+  }
+}
+
+class HBLGMConfigApp extends Application {
+  constructor(options = {}) {
+    super(options);
+    this.puzzleId = options.puzzleId ?? null;
+    this.puzzle = null;
+  }
+
+  static get defaultOptions() {
+    return foundry.utils.mergeObject(super.defaultOptions, {
+      id: "hbl-gm-config",
+      title: "Hexcode Breach Lite — GM Config",
+      template: `modules/${HBL_ID}/templates/gm-config.hbs`,
+      width: 980,
+      height: 820,
+      resizable: true,
+      classes: ["hbl", "hbl-gm"]
+    });
+  }
+
+  async resolveRewardNames() {
+    this.puzzle = await HBL.resolvePayloadNames(this.puzzle);
+  }
+
+  async getData() {
+    const puzzles = await HBL.getScenePuzzles();
+    if (this.puzzleId && puzzles[this.puzzleId]) this.puzzle = HBL.normalizePuzzle(puzzles[this.puzzleId]);
+    else if (!this.puzzle) this.puzzle = HBL.defaultPuzzle();
+    this.puzzle = HBL.normalizePuzzle(this.puzzle);
+    await this.resolveRewardNames();
+
+    return {
+      puzzle: this.puzzle,
+      puzzles: Object.values(puzzles).sort((a, b) => String(a.name).localeCompare(String(b.name))),
+      templates: Object.entries(HBL.TEMPLATES).map(([key, value]) => ({ key, ...value })),
+      sceneName: HBL.getScene()?.name ?? "No Active Scene",
+      boundTileCount: HBL.getBoundTileCount(this.puzzle.id),
+      helperCommand: `const hbl = game.modules.get("hexcode-breach-lite")?.api;\nif (!hbl) return ui.notifications.error("Hexcode Breach Lite API is not available. Confirm the module is enabled, then restart Foundry.");\nreturn hbl.openBound({\n  args: typeof args === "undefined" ? null : args,\n  tile: typeof tile === "undefined" ? null : tile,\n  token: typeof token === "undefined" ? null : token,\n  actor: typeof actor === "undefined" ? null : actor\n});`,
+      hasSavedPuzzle: Boolean(this.puzzleId && puzzles[this.puzzleId]),
+      hexPoolValue: this.puzzle.hexPool.join(" "),
+      hexChoices: HBL.DEFAULT_HEX.map(value => ({ value, active: this.puzzle.hexPool.includes(value) })),
+      sequenceRows: this.puzzle.sequences.map((sequence, index) => ({
+        ...sequence,
+        index,
+        displayIndex: index + 1,
+        codeText: sequence.code.join(" "),
+        codeDisplay: sequence.code.join(" → "),
+        codeChoices: HBL.DEFAULT_HEX.map(value => ({
+          value,
+          count: sequence.code.filter(entry => entry === value).length,
+          sequenceIndex: index
+        })),
+        codeTokens: sequence.code.map((value, position) => ({
+          value,
+          position,
+          displayPosition: position + 1,
+          sequenceIndex: index
+        })),
+        canDeleteSequence: this.puzzle.sequences.length > 1,
+        rewardDisplay: sequence.rewardName || sequence.rewardUuid || "Drop an Item here or browse",
+        tableDisplay: sequence.rollTableName || sequence.rollTableRef || "Drop a RollTable here or browse",
+        rewardLoaded: Boolean(sequence.rewardUuid),
+        tableLoaded: Boolean(sequence.rollTableRef),
+        rewardFieldDisplay: sequence.rewardUuid
+          ? `${sequence.rewardName || "Item"} — ${sequence.rewardUuid}`
+          : "",
+        tableFieldDisplay: sequence.rollTableRef
+          ? `${sequence.rollTableName || "RollTable"} — ${sequence.rollTableRef}`
+          : ""
+      }))
+    };
+  }
+
+  activateListeners(html) {
+    super.activateListeners(html);
+
+    html.find("[data-action='new']").on("click", () => {
+      this.puzzle = HBL.defaultPuzzle();
+      this.puzzleId = null;
+      this.render();
+    });
+
+    html.find("[data-action='load']").on("change", event => {
+      this.puzzleId = event.currentTarget.value || null;
+      this.puzzle = null;
+      this.render();
+    });
+
+    html.find("[data-action='append-sequence-hex']").on("click", event => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      const index = Number(event.currentTarget.dataset.index);
+      const value = String(event.currentTarget.dataset.hex || "").toUpperCase();
+      const sequence = this.puzzle.sequences[index];
+      if (!sequence || !HBL.DEFAULT_HEX.includes(value)) return;
+
+      sequence.code.push(value);
+      this.puzzle.templateKey = "custom";
+      this.puzzle.hexPool = HBL.deriveHexPool(this.puzzle.sequences);
+      this.puzzle.matrix = HBL.generateMatrix(this.puzzle.gridSize, this.puzzle.hexPool);
+      this.render();
+    });
+
+    html.find("[data-action='remove-sequence-hex']").on("click", event => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      const index = Number(event.currentTarget.dataset.index);
+      const position = Number(event.currentTarget.dataset.position);
+      const sequence = this.puzzle.sequences[index];
+      if (!sequence || !Number.isInteger(position) || position < 0 || position >= sequence.code.length) return;
+      if (sequence.code.length === 1) {
+        return ui.notifications.warn("Each breach sequence must contain at least one hexcode.");
+      }
+
+      sequence.code.splice(position, 1);
+      this.puzzle.templateKey = "custom";
+      this.puzzle.hexPool = HBL.deriveHexPool(this.puzzle.sequences);
+      this.puzzle.matrix = HBL.generateMatrix(this.puzzle.gridSize, this.puzzle.hexPool);
+      this.render();
+    });
+
+    html.find("[data-action='apply-template']").on("click", () => {
+      const form = hblGetForm(html);
+      if (!form) return ui.notifications.error("Hexcode Breach GM form could not be found. Please close and reopen the window.");
+      const key = form.querySelector("[name='templateKey']")?.value || "standard";
+      if (!HBL.TEMPLATES[key]) return ui.notifications.info("Choose a named network template to apply.");
+      const currentName = form.querySelector("[name='name']")?.value?.trim();
+      this.puzzle = HBL.puzzleFromTemplate(key, {
+        id: this.puzzle?.id || hblRandomId(),
+        name: currentName || HBL.TEMPLATES[key]?.label || "Hexcode Breach",
+        publicProgress: form.querySelector("[name='publicProgress']")?.checked ?? true,
+        createdAt: this.puzzle?.createdAt || Date.now()
+      });
+      this.render();
+    });
+
+    html.find("[data-action='add-sequence']").on("click", () => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      this.puzzle.sequences.push(HBL.newSequence({ label: "New Sequence", code: ["1C", "55"] }));
+      this.render();
+    });
+
+    html.find("[data-action='remove-sequence']").on("click", event => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      if (this.puzzle.sequences.length <= 1) {
+        return ui.notifications.warn("A breach puzzle must retain at least one sequence.");
+      }
+      const sequenceId = String(event.currentTarget.dataset.sequenceId || "");
+      let index = sequenceId
+        ? this.puzzle.sequences.findIndex(sequence => sequence.id === sequenceId)
+        : Number(event.currentTarget.dataset.index);
+      if (!Number.isInteger(index) || index < 0 || index >= this.puzzle.sequences.length) {
+        return ui.notifications.warn("That sequence could not be found. Close and reopen the GM window, then try again.");
+      }
+      const [removed] = this.puzzle.sequences.splice(index, 1);
+      this.puzzle.templateKey = "custom";
+      this.puzzle.hexPool = HBL.deriveHexPool(this.puzzle.sequences);
+      this.puzzle.matrix = HBL.generateMatrix(this.puzzle.gridSize, this.puzzle.hexPool);
+      ui.notifications.info(`Removed sequence: ${removed?.label || "Sequence"}. Save the puzzle to persist the change.`);
+      this.render(true);
+    });
+
+    html.find("[data-action='rebuild']").on("click", () => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      this.puzzle.matrix = HBL.generateMatrix(this.puzzle.gridSize, this.puzzle.hexPool);
+      this.render();
+    });
+
+    html.find("[data-action='save']").on("click", async () => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      const saved = await HBL.savePuzzle(this.puzzle);
+      this.puzzleId = saved?.id ?? this.puzzleId;
+      this.puzzle = saved ?? this.puzzle;
+      this.render();
+    });
+
+    html.find("[data-action='open-player']").on("click", async () => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      const saved = await HBL.savePuzzle(this.puzzle);
+      if (saved?.id) {
+        new HBLPlayerApp({
+          puzzleId: saved.id,
+          actor: HBL.getUserActor(),
+          gmPreview: true
+        }).render(true);
+      }
+    });
+
+    html.find("[data-action='bind-tile']").on("click", async () => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      const saved = await HBL.savePuzzle(this.puzzle);
+      if (!saved?.id) return;
+      this.puzzleId = saved.id;
+      this.puzzle = saved;
+      await HBL.bindSelectedTiles(saved);
+      this.render();
+    });
+
+    html.find("[data-action='unbind-tile']").on("click", async () => {
+      await HBL.unbindSelectedTiles();
+      this.render();
+    });
+
+    html.find("[data-action='create-helper']").on("click", async () => HBL.createHelperMacro());
+    html.find("[data-action='delete']").on("click", async () => this.deleteCurrentPuzzle());
+
+    html.find(".hbl-document-drop").on("dragover", event => {
+      event.preventDefault();
+      event.currentTarget.classList.add("dragover");
+    }).on("dragleave", event => event.currentTarget.classList.remove("dragover"))
+      .on("drop", async event => {
+        event.preventDefault();
+        event.currentTarget.classList.remove("dragover");
+        const index = Number(event.currentTarget.dataset.index);
+        const kind = event.currentTarget.dataset.kind;
+        const expected = kind === "item" ? "Item" : "RollTable";
+        const doc = await HBL.documentFromDrop(event, expected);
+        if (!doc) return ui.notifications.warn(`Drop a ${expected} document from the sidebar or a compendium.`);
+        if (!this._updatePuzzleFromForm(html)) return;
+        this.setSequenceDocument(index, kind, doc);
+        this.render(true);
+      });
+
+    html.find("[data-action='browse-item']").on("click", event => {
+      const index = Number(event.currentTarget.dataset.index);
+      if (!this._updatePuzzleFromForm(html)) return;
+      HBL.openDocumentPicker("Item", async doc => {
+        this.setSequenceDocument(index, "item", doc);
+        this.render(true);
+      });
+    });
+
+    html.find("[data-action='browse-table']").on("click", event => {
+      const index = Number(event.currentTarget.dataset.index);
+      if (!this._updatePuzzleFromForm(html)) return;
+      HBL.openDocumentPicker("RollTable", async doc => {
+        this.setSequenceDocument(index, "table", doc);
+        this.render(true);
+      });
+    });
+
+    html.find("[data-action='clear-item']").on("click", event => {
+      const index = Number(event.currentTarget.dataset.index);
+      if (!this._updatePuzzleFromForm(html)) return;
+      this.puzzle.sequences[index].rewardUuid = "";
+      this.puzzle.sequences[index].rewardName = "";
+      this.render();
+    });
+
+    html.find("[data-action='clear-table']").on("click", event => {
+      const index = Number(event.currentTarget.dataset.index);
+      if (!this._updatePuzzleFromForm(html)) return;
+      this.puzzle.sequences[index].rollTableRef = "";
+      this.puzzle.sequences[index].rollTableName = "";
+      this.render();
+    });
+
+    html.find("[data-action='test-table']").on("click", async event => {
+      const index = Number(event.currentTarget.dataset.index);
+      if (!this._updatePuzzleFromForm(html)) return;
+      const sequence = this.puzzle.sequences[index];
+      if (!sequence?.rollTableRef) return ui.notifications.warn("Select or drop a RollTable first.");
+      const data = await HBL.drawData(sequence.rollTableRef);
+      const results = data?.results?.map(result => `<li>${result}</li>`).join("") || "<li>No result.</li>";
+      return new Dialog({
+        title: `RollTable Test — ${data?.tableName || sequence.rollTableRef}`,
+        content: `<div class="hbl-chat-card"><h3>Non-destructive Test Roll</h3><ul>${results}</ul></div>`,
+        buttons: { close: { label: "Close" } }
+      }).render(true);
+    });
+  }
+
+  setSequenceDocument(index, kind, doc) {
+    const sequence = this.puzzle.sequences[index];
+    if (!sequence) return;
+    if (kind === "item" && doc.documentName === "Item") {
+      const reference = HBL.documentReference(doc);
+      if (!reference) return ui.notifications.warn(`Could not create a stable reference for Item: ${doc.name}`);
+      sequence.rewardUuid = reference;
+      sequence.rewardName = doc.name;
+      ui.notifications.info(`Item reward loaded: ${doc.name}`);
+    }
+    if (kind === "table" && doc.documentName === "RollTable") {
+      const reference = HBL.documentReference(doc);
+      if (!reference) return ui.notifications.warn(`Could not create a stable reference for RollTable: ${doc.name}`);
+      sequence.rollTableRef = reference;
+      sequence.rollTableName = doc.name;
+      ui.notifications.info(`Data RollTable loaded: ${doc.name}`);
+    }
+  }
+
+  async deleteCurrentPuzzle() {
+    if (!this.puzzleId) return ui.notifications.warn("Load a saved breach before deleting it.");
+    const ok = await Dialog.confirm({
+      title: "Delete Scene Breach?",
+      content: `<p>Delete <b>${hblEsc(this.puzzle.name)}</b> and remove its tile bindings from <b>${hblEsc(HBL.getScene()?.name || "this scene")}</b>?</p>`
+    });
+    if (!ok) return;
+    const result = await HBL.deletePuzzle(this.puzzleId);
+    if (!result?.ok) return;
+    this.puzzle = null;
+    this.puzzleId = null;
+    await this.render(true);
+  }
+
+  _updatePuzzleFromForm(html) {
+    const form = hblGetForm(html);
+    if (!form) {
+      console.error(`${HBL_ID} | GM form root was not an HTMLFormElement`, html?.[0] ?? html);
+      ui.notifications.error("Hexcode Breach GM form could not be found. Please close and reopen the window.");
+      return false;
+    }
+    const fd = new FormData(form);
+    this.puzzle = HBL.normalizePuzzle(this.puzzle);
+    this.puzzle.name = String(fd.get("name") || "Hexcode Breach");
+    this.puzzle.templateKey = String(fd.get("templateKey") || "custom");
+    this.puzzle.gridSize = Math.clamp(Number(fd.get("gridSize")) || 5, 4, 8);
+    this.puzzle.bufferSize = Math.clamp(Number(fd.get("bufferSize")) || 6, 4, 14);
+    this.puzzle.timerSeconds = Math.clamp(Number(fd.get("timerSeconds")) || 0, 0, 600);
+    this.puzzle.publicProgress = fd.get("publicProgress") === "on";
+    const previousPool = hblClone(this.puzzle.hexPool);
+
+    const sequenceCount = Math.max(0, Number(fd.get("sequenceCount")) || this.puzzle.sequences.length);
+    const sequences = [];
+    for (let i = 0; i < sequenceCount; i++) {
+      const existing = this.puzzle.sequences[i] || {};
+      const label = String(fd.get(`sequences.${i}.label`) || "").trim();
+      const code = HBL.parseCode(fd.get(`sequences.${i}.code`) || "");
+      if (!label && !code.length) continue;
+      sequences.push(HBL.newSequence({
+        id: fd.get(`sequences.${i}.id`) || existing.id || hblRandomId(),
+        label: label || "Sequence",
+        code,
+        eurobucks: fd.get(`sequences.${i}.eurobucks`),
+        rewardUuid: fd.get(`sequences.${i}.rewardUuid`),
+        rewardName: fd.get(`sequences.${i}.rewardName`) || existing.rewardName,
+        rollTableRef: fd.get(`sequences.${i}.rollTableRef`),
+        rollTableName: fd.get(`sequences.${i}.rollTableName`) || existing.rollTableName
+      }));
+    }
+    this.puzzle.sequences = sequences.length
+      ? sequences
+      : [HBL.newSequence({ label: "Basic Access", code: ["1C", "55"] })];
+
+    this.puzzle.hexPool = HBL.deriveHexPool(this.puzzle.sequences);
+    const poolChanged = previousPool.join("|") !== this.puzzle.hexPool.join("|");
+
+    if (
+      poolChanged
+      || !this.puzzle.matrix?.length
+      || this.puzzle.matrix.length !== this.puzzle.gridSize
+      || this.puzzle.matrix.some(row => row.length !== this.puzzle.gridSize)
+      || this.puzzle.matrix.some(row => row.some(value => !this.puzzle.hexPool.includes(value)))
+    ) {
+      this.puzzle.matrix = HBL.generateMatrix(this.puzzle.gridSize, this.puzzle.hexPool);
+    }
+    return true;
+  }
+}
+
+class HBLPlayerApp extends Application {
+  constructor(options = {}) {
+    super(options);
+    this.puzzleId = options.puzzleId ?? null;
+    this.puzzle = null;
+    this.buffer = [];
+    this.clicked = [];
+    this.startedAt = null;
+    this.timer = null;
+    this.remaining = 0;
+    this.timeLimit = null;
+    this.actor = options.actor ?? HBL.getUserActor();
+    this.gmPreview = Boolean(options.gmPreview && game.user.isGM);
+    this.enforceRole = !this.gmPreview;
+    this.finished = false;
+    this.resetUsed = false;
+    this.claimedSequenceIds = new Set();
+  }
+
+  static get defaultOptions() {
+    return foundry.utils.mergeObject(super.defaultOptions, {
+      id: "hbl-player",
+      title: "Hexcode Breach",
+      template: `modules/${HBL_ID}/templates/player-breach.hbs`,
+      width: 760,
+      height: "auto",
+      resizable: true,
+      classes: ["hbl", "hbl-player"]
+    });
+  }
+
+  async getData() {
+    if (this.enforceRole && !HBL.isNetrunner(this.actor)) {
+      const puzzle = this.puzzleId ? await HBL.getPuzzle(this.puzzleId) : null;
+      await HBL.postRoleDenied(this.actor, puzzle);
+      setTimeout(() => this.close(), 0);
+      return { blocked: true };
+    }
+
+    const puzzles = await HBL.getScenePuzzles();
+    if (!this.puzzle) {
+      if (this.puzzleId && puzzles[this.puzzleId]) this.puzzle = HBL.normalizePuzzle(puzzles[this.puzzleId]);
+      else this.puzzle = HBL.normalizePuzzle(Object.values(puzzles)[0] ?? HBL.defaultPuzzle());
+      this.puzzle = await HBL.resolvePayloadNames(this.puzzle);
+      this.puzzle.sequences = this.puzzle.sequences.map(sequence => ({
+        ...sequence,
+        solved: false,
+        rewardGranted: this.claimedSequenceIds.has(sequence.id)
+      }));
+      this.timeLimit = Number(this.puzzle.timerSeconds) || 0;
+      this.remaining = this.timeLimit;
+    }
+
+    const matrixRows = this.puzzle.matrix.map((row, r) => row.map((value, c) => ({
+      value,
+      r,
+      c,
+      key: `${r}-${c}`,
+      clicked: this.clicked.some(cell => cell.r === r && cell.c === c),
+      allowed: this.isAllowed(r, c)
+    })));
+
+    const solvedCount = this.puzzle.sequences.filter(sequence => sequence.solved).length;
+    return {
+      blocked: false,
+      puzzle: this.puzzle,
+      matrixRows,
+      buffer: Array.from({ length: this.puzzle.bufferSize }, (_, index) => this.buffer[index] ?? ""),
+      remaining: this.remaining,
+      timerDisplay: this.puzzle.timerSeconds ? this.remaining : "∞",
+      timerStarted: Boolean(this.startedAt),
+      actorName: this.actor?.name ?? "No actor selected",
+      isNetrunner: HBL.isNetrunner(this.actor),
+      gmPreview: this.gmPreview,
+      solvedCount,
+      canComplete: solvedCount > 0,
+      resetUsed: this.resetUsed,
+      resetAvailable: Boolean(this.startedAt && !this.resetUsed && !this.finished),
+      resetLabel: this.resetUsed ? "Reset Used" : "Emergency Reset (1)"
+    };
+  }
+
+  activateListeners(html) {
+    super.activateListeners(html);
+    html.find(".hbl-cell").on("click", event => this.onCellClick(event));
+    html.find("[data-action='clear']").on("click", () => this.resetRun());
+    html.find("[data-action='complete']").on("click", () => {
+      if (!this.puzzle.sequences.some(sequence => sequence.solved)) {
+        return ui.notifications.warn("Crack at least one sequence before completing the breach.");
+      }
+      return this.finishRun("Operator completed breach");
+    });
+    html.find("[data-action='close']").on("click", () => this.close());
+  }
+
+  async startTimer() {
+    if (this.startedAt || this.finished) return;
+    this.timeLimit = Number(this.puzzle.timerSeconds) || 0;
+    this.remaining = this.timeLimit;
+    this.startedAt = Date.now();
+    this.element.find(".hbl-timer-state").text("ACTIVE");
+
+    await HBL.postProgress(
+      this.puzzle,
+      `<p><b>${hblEsc(game.user.name)}</b> started a breach${this.actor ? ` as <b>${hblEsc(this.actor.name)}</b>` : ""}.</p>`,
+      { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
+    );
+    this.beginCountdown();
+  }
+
+  beginCountdown() {
+    this.stopTimer();
+    if (!this.timeLimit) return;
+    const startedAt = this.startedAt;
+    const limit = this.timeLimit;
+    this.timer = window.setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+      this.remaining = Math.max(0, limit - elapsed);
+      this.element.find(".hbl-timer").text(this.remaining);
+      if (this.remaining <= 0) this.finishRun("Timer expired");
+    }, 250);
+  }
+
+  isAllowed(r, c) {
+    if (this.clicked.some(cell => cell.r === r && cell.c === c)) return false;
+    if (!this.clicked.length) return r === 0;
+    const last = this.clicked[this.clicked.length - 1];
+    return this.clicked.length % 2 === 1 ? c === last.c : r === last.r;
+  }
+
+  async onCellClick(event) {
+    if (this.finished) return;
+    const r = Number(event.currentTarget.dataset.r);
+    const c = Number(event.currentTarget.dataset.c);
+    if (!this.isAllowed(r, c)) {
+      return ui.notifications.warn("Invalid breach path. First pick must be top row, then alternate column/row.");
+    }
+
+    if (!this.startedAt) await this.startTimer();
+
+    const value = this.puzzle.matrix[r][c];
+    this.clicked.push({ r, c, value });
+    this.buffer.push(value);
+    await this.checkSequences();
+
+    if (this.finished) return;
+    if (this.puzzle.sequences.every(sequence => sequence.solved)) return this.success("All sequences cracked");
+    if (this.buffer.length >= this.puzzle.bufferSize) return this.finishRun("Buffer filled");
+    return this.render();
+  }
+
+  bufferContains(code) {
+    if (!code?.length) return false;
+    const buffer = this.buffer;
+    outer: for (let i = 0; i <= buffer.length - code.length; i++) {
+      for (let j = 0; j < code.length; j++) {
+        if (buffer[i + j] !== code[j]) continue outer;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  async checkSequences() {
+    for (const sequence of this.puzzle.sequences) {
+      if (!sequence.solved && this.bufferContains(sequence.code)) {
+        sequence.solved = true;
+        const rewardHtml = await HBL.grantSequenceRewards(this.actor, sequence, this.puzzle);
+        if (sequence.rewardGranted) this.claimedSequenceIds.add(sequence.id);
+        await HBL.postProgress(
+          this.puzzle,
+          `<p>Sequence cracked: <b>${hblEsc(sequence.label)}</b> <code>${sequence.code.map(hblEsc).join(" ")}</code></p>${rewardHtml}`,
+          { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
+        );
+        ui.notifications.info(`Sequence cracked: ${sequence.label}`);
+      }
+    }
+  }
+
+  async finishRun(reason = "Breach ended") {
+    if (this.finished) return;
+    return this.puzzle.sequences.some(sequence => sequence.solved) ? this.success(reason) : this.fail(reason);
+  }
+
+  async success(reason = "Breach complete") {
+    if (this.finished) return;
+    this.finished = true;
+    this.stopTimer();
+    const solved = this.puzzle.sequences.filter(sequence => sequence.solved);
+    const missed = this.puzzle.sequences.filter(sequence => !sequence.solved);
+    const solvedList = solved.map(sequence => `<li><b>${hblEsc(sequence.label)}</b>: <code>${sequence.code.map(hblEsc).join(" ")}</code></li>`).join("");
+    const missedList = missed.length
+      ? `<p class="hbl-muted">Unresolved: ${missed.map(sequence => hblEsc(sequence.label)).join(", ")}</p>`
+      : "";
+    await HBL.postProgress(
+      this.puzzle,
+      `<p class="hbl-success"><b>BREACH SUCCESSFUL</b> — ${hblEsc(reason)}</p><p>Buffer: <code>${this.buffer.map(hblEsc).join(" ")}</code></p><ul>${solvedList}</ul>${missedList}`,
+      { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
+    );
+    ui.notifications.info(`Breach successful: ${solved.length} sequence${solved.length === 1 ? "" : "s"} cracked.`);
+    return this.close();
+  }
+
+  async fail(reason = "Breach failed") {
+    if (this.finished) return;
+    this.finished = true;
+    this.stopTimer();
+    await HBL.postProgress(
+      this.puzzle,
+      `<p class="hbl-fail"><b>BREACH FAILED:</b> ${hblEsc(reason)}</p><p>Buffer: <code>${this.buffer.map(hblEsc).join(" ")}</code></p>`,
+      { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
+    );
+    ui.notifications.warn(`Breach failed: ${reason}`);
+    return this.close();
+  }
+
+  async resetRun() {
+    if (this.finished) return;
+    if (!this.startedAt) return ui.notifications.warn("The emergency reset becomes available after the first hex is selected.");
+    if (this.resetUsed) return ui.notifications.warn("The one permitted emergency reset has already been used.");
+
+    const previousRemaining = this.remaining;
+    this.resetUsed = true;
+    this.stopTimer();
+    this.buffer = [];
+    this.clicked = [];
+    this.puzzle.matrix = HBL.generateMatrix(this.puzzle.gridSize, this.puzzle.hexPool);
+    this.puzzle.sequences = this.puzzle.sequences.map(sequence => ({
+      ...sequence,
+      rewardGranted: this.claimedSequenceIds.has(sequence.id)
+    }));
+
+    if (this.puzzle.timerSeconds) {
+      this.timeLimit = Math.max(1, Math.floor(previousRemaining / 2));
+      this.remaining = this.timeLimit;
+      this.startedAt = Date.now();
+      this.beginCountdown();
+    } else {
+      this.timeLimit = 0;
+      this.remaining = 0;
+      this.startedAt = Date.now();
+    }
+
+    const solvedCount = this.puzzle.sequences.filter(sequence => sequence.solved).length;
+    const timerText = this.puzzle.timerSeconds
+      ? `The remaining clock was halved from ${previousRemaining}s to ${this.timeLimit}s.`
+      : "This breach has no timer, but its single reset is now spent.";
+    await HBL.postProgress(
+      this.puzzle,
+      `<p class="hbl-reset-log"><b>EMERGENCY RESET USED</b> by ${hblEsc(this.actor?.name || game.user.name)}.</p><p>${hblEsc(timerText)}</p><p>Buffer and matrix were reset. ${solvedCount ? `${solvedCount} previously cracked sequence${solvedCount === 1 ? " remains" : "s remain"} secured.` : "No sequence had been secured."}</p>`,
+      { force: true, speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
+    );
+    ui.notifications.warn(`Emergency reset used. ${timerText}`);
+    return this.render();
+  }
+
+  stopTimer() {
+    if (this.timer) window.clearInterval(this.timer);
+    this.timer = null;
+  }
+
+  async close(options) {
+    this.stopTimer();
+    return super.close(options);
+  }
+}
+
+function hblExposeApi() {
+  const module = game.modules.get(HBL_ID);
+  if (module) module.api = HBL.api;
+  window.HexcodeBreachLite = HBL.api;
+  game.hexcodebreach = async context => game.modules.get(HBL_ID)?.api?.openBound(context);
+}
+
+Hooks.once("init", () => {
+  game.settings.register(HBL_ID, "enableDebug", {
+    name: "Enable Debug Logging",
+    hint: "Log Hexcode Breach Lite debug information to the console.",
+    scope: "world",
+    config: true,
+    type: Boolean,
+    default: false
+  });
+  // Expose the public API during init as well as ready. This makes the helper
+  // resilient to module/Macro execution ordering during Foundry startup.
+  hblExposeApi();
+});
+
+Hooks.once("ready", () => {
+  hblExposeApi();
+  console.log(`${HBL_ID} | Ready. API: HexcodeBreachLite.openGM(), HexcodeBreachLite.openPuzzle(id), game.hexcodebreach(context)`);
+});
+
+Hooks.on("getSceneControlButtons", controls => {
+  if (!game.user.isGM) return;
+  const tokenControls = controls.find(control => control.name === "token");
+  if (!tokenControls) return;
+  tokenControls.tools.push({
+    name: "hbl-open-gm",
+    title: "Hexcode Breach Lite",
+    icon: "fas fa-code",
+    button: true,
+    onClick: () => HBL.api.openGM()
+  });
+});
+
+
+function hblRefreshOpenGMWindows(sceneId = null) {
+  for (const app of Object.values(ui?.windows || {})) {
+    if (!(app instanceof HBLGMConfigApp)) continue;
+    const activeSceneId = HBL.getScene()?.id ?? null;
+    if (sceneId && activeSceneId && sceneId !== activeSceneId) continue;
+    app.render(false);
+  }
+}
+
+Hooks.on("deleteTile", tile => {
+  hblRefreshOpenGMWindows(tile?.parent?.id ?? tile?.parent?.parent?.id ?? null);
+});
+
+Hooks.on("updateTile", (tile, changes) => {
+  if (changes?.flags?.[HBL_ID] !== undefined) {
+    hblRefreshOpenGMWindows(tile?.parent?.id ?? null);
+  }
+});
