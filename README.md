@@ -3,9 +3,9 @@ A lightweight Cyberpunk-style hexcode breach minigame for Foundry VTT v12 and Cy
 
 Module assisted with AI. Legacy Proof of concept Macro found at Cyberpunk Red Foundry VTT shared content discord. 
 
-## Stable release: v1.0.4
+## Verification candidate: v1.0.5
 
-Originally released stable on **2026-08-02** after successful live testing with separate Gamemaster and player accounts. **v1.0.4 (2026-08-14)** is the current icon-path hotfix. It keeps the validated v1.0.3 Monk's Active Tile Triggers helper behavior and replaces the nonexistent circuit icon with the Cyberpunk RED computer icon; no puzzle-data migration is required.
+Originally released stable on **2026-08-02** after successful live testing with separate Gamemaster and player accounts. **v1.0.5 (verification candidate, 2026-08-28)** builds on the validated v1.0.4 helper/icon behavior and adds an explicit companion-module outcome contract for CitiNet-style Hexcode locks. This candidate is not stamped as a new stable release until live audit/testing is complete; no puzzle-data migration is required.
 
 ### Core features
 
@@ -17,7 +17,7 @@ Originally released stable on **2026-08-02** after successful live testing with 
 - Editable named templates.
 - Repeatable hexcodes inside ordered sequences.
 - Timer begins on the first valid hexcode selection.
-- A single cracked sequence counts as a successful breach.
+- A single cracked sequence secures **partial success**; cracking every configured sequence is **full success**.
 - One-use Emergency Reset that clears the current buffer, rebuilds the matrix, halves remaining time, and records the reset in chat.
 - Eurobuck, Item, and RollTable data rewards.
 - Drag-and-drop and searchable Item / RollTable selection.
@@ -70,6 +70,38 @@ return hbl.openBound({
 Select the Tile with Foundry Tile Controls and press **Bind Selected Tile** in the GM window. The binding stores both the active Scene ID and breach puzzle ID on the Tile. Monk's Active Tile Triggers v12 supplies the triggering Tile, Token, Actor, and action arguments to Script Macros. The helper forwards those values directly to `module.api.openBound()` so no puzzle ID needs to be hard-coded. Leave the Monk's argument field blank for Tile-bound puzzles.
 
 If a helper Macro from v1.0.1 or v1.0.2 was manually edited and Foundry reports a Macro Joint Validation error, delete that helper Macro and use **Create Helper Macro** once to create a clean v1.0.3 copy.
+
+
+## Companion-module / CitiNet close hook
+
+When the player breach window has actually closed, Hexcode Breach Lite fires:
+
+```js
+Hooks.callAll("closeHBLPlayerApp", app, resultData);
+```
+
+`app` remains the first argument for compatibility. Companion modules should use `resultData` for the unambiguous final state:
+
+- `outcome: "success"` — every configured sequence was cracked.
+- `outcome: "partial"` — one or more sequences were cracked, but not all. This includes intentionally completing early, timer/buffer resolution after securing a sequence, or manually closing after securing a sequence.
+- `outcome: "failure"` — the breach formally ended with no secured sequence.
+- `outcome: "aborted"` — the player manually closed the breach before securing any sequence.
+
+The payload also includes `reason`, `puzzleId`, `puzzleName`, `actorId`, `actorUuid`, `solvedCount`, `totalSequences`, `solvedSequenceIds`, and `gmPreview`. A CitiNet listener should explicitly decide whether a particular lock accepts `partial`; it should also ignore `gmPreview: true` for live unlocks.
+
+Example:
+
+```js
+Hooks.on("closeHBLPlayerApp", (app, result) => {
+  if (result.gmPreview) return;
+  if (result.outcome === "success") {
+    // Full-success unlock.
+  }
+  if (result.outcome === "partial") {
+    // Optional partial-success handling for this specific CitiNet lock.
+  }
+});
+```
 
 ## Storage model
 
