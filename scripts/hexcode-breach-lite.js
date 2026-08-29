@@ -1262,6 +1262,9 @@ class HBLPlayerApp extends Application {
     this.gmPreview = Boolean(options.gmPreview && game.user.isGM);
     this.enforceRole = !this.gmPreview;
     this.finished = false;
+    this.outcome = "active";
+    this.outcomeReason = null;
+    this._closeHookFired = false;
     this.resetUsed = false;
     this.claimedSequenceIds = new Set();
   }
@@ -1437,22 +1440,32 @@ class HBLPlayerApp extends Application {
     this.stopTimer();
     const solved = this.puzzle.sequences.filter(sequence => sequence.solved);
     const missed = this.puzzle.sequences.filter(sequence => !sequence.solved);
+    const fullSuccess = solved.length === this.puzzle.sequences.length;
+    this.outcome = fullSuccess ? "success" : "partial";
+    this.outcomeReason = reason;
     const solvedList = solved.map(sequence => `<li><b>${hblEsc(sequence.label)}</b>: <code>${sequence.code.map(hblEsc).join(" ")}</code></li>`).join("");
     const missedList = missed.length
       ? `<p class="hbl-muted">Unresolved: ${missed.map(sequence => hblEsc(sequence.label)).join(", ")}</p>`
       : "";
+    const resultLabel = fullSuccess ? "BREACH SUCCESSFUL" : "BREACH PARTIAL SUCCESS";
     await HBL.postProgress(
       this.puzzle,
-      `<p class="hbl-success"><b>BREACH SUCCESSFUL</b> — ${hblEsc(reason)}</p><p>Buffer: <code>${this.buffer.map(hblEsc).join(" ")}</code></p><ul>${solvedList}</ul>${missedList}`,
+      `<p class="hbl-success"><b>${resultLabel}</b> — ${hblEsc(reason)}</p><p>Buffer: <code>${this.buffer.map(hblEsc).join(" ")}</code></p><ul>${solvedList}</ul>${missedList}`,
       { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
     );
-    ui.notifications.info(`Breach successful: ${solved.length} sequence${solved.length === 1 ? "" : "s"} cracked.`);
+    if (fullSuccess) {
+      ui.notifications.info(`Breach successful: all ${solved.length} sequence${solved.length === 1 ? "" : "s"} cracked.`);
+    } else {
+      ui.notifications.info(`Partial breach success: ${solved.length} of ${this.puzzle.sequences.length} sequences cracked.`);
+    }
     return this.close();
   }
 
   async fail(reason = "Breach failed") {
     if (this.finished) return;
     this.finished = true;
+    this.outcome = "failure";
+    this.outcomeReason = reason;
     this.stopTimer();
     await HBL.postProgress(
       this.puzzle,
@@ -1510,7 +1523,42 @@ class HBLPlayerApp extends Application {
 
   async close(options) {
     this.stopTimer();
-    return super.close(options);
+
+    // Manual closure is not a failure. If at least one sequence was already
+    // secured, expose it as a partial result; otherwise expose an abort.
+    if (this.outcome === "active") {
+      const solvedCount = this.puzzle?.sequences?.filter(sequence => sequence.solved).length ?? 0;
+      this.outcome = solvedCount > 0 ? "partial" : "aborted";
+      this.outcomeReason = solvedCount > 0
+        ? "Operator closed the breach after securing one or more sequences"
+        : "Operator closed the breach before securing a sequence";
+    }
+
+    const result = await super.close(options);
+
+    // Fire exactly once, after the Foundry window has actually closed. The app
+    // remains the first argument for compatibility; resultData is the preferred
+    // CitiNet/companion-module contract.
+    if (!this._closeHookFired) {
+      this._closeHookFired = true;
+      const sequences = this.puzzle?.sequences ?? [];
+      const solved = sequences.filter(sequence => sequence.solved);
+      const resultData = {
+        outcome: this.outcome,
+        reason: this.outcomeReason,
+        puzzleId: this.puzzleId ?? this.puzzle?.id ?? null,
+        puzzleName: this.puzzle?.name ?? null,
+        actorId: this.actor?.id ?? null,
+        actorUuid: this.actor?.uuid ?? null,
+        solvedCount: solved.length,
+        totalSequences: sequences.length,
+        solvedSequenceIds: solved.map(sequence => sequence.id),
+        gmPreview: this.gmPreview
+      };
+      Hooks.callAll("closeHBLPlayerApp", this, resultData);
+    }
+
+    return result;
   }
 }
 
