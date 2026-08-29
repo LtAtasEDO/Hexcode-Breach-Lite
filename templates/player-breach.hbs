@@ -4,7 +4,7 @@
     <div>
       <h2>{{puzzle.name}}</h2>
       <p>Actor: {{actorName}} {{#if gmPreview}}<span class="hbl-preview-badge">GM PREVIEW — ROLE LOCK BYPASSED</span>{{else}}{{#if isNetrunner}}<span class="hbl-role-ok">NETRUNNER VERIFIED</span>{{/if}}{{/if}}</p>
-      <p class="hbl-run-status">Sequences cracked: <b>{{solvedCount}}</b> / {{puzzle.sequences.length}}</p>
+      <p class="hbl-run-status">Sequences cracked: <b>{{solvedCount}}</b> / {{puzzle.sequences.length}} — one secured sequence is partial success; all sequences is full success.</p>
     </div>
     <div class="hbl-clock">
       <span><span class="hbl-timer">{{timerDisplay}}</span>{{#if puzzle.timerSeconds}}s{{/if}}</span>
