@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.5 — 2026-08-28
+
+Verification candidate for the CitiNet/companion-module close-hook integration.
+
+- Added explicit player-run outcomes: `success`, `partial`, `failure`, and `aborted`.
+- Cracking one or more but not all sequences is now reported as **partial success**; cracking every sequence is **full success**. The established rule that one cracked sequence secures its payload/reward remains unchanged.
+- Manual close after securing at least one sequence reports `partial`; manual close before securing a sequence reports `aborted`.
+- `closeHBLPlayerApp` now fires after `super.close()` completes rather than before the Foundry window closes.
+- The hook still passes the app instance first for compatibility and now passes a second `resultData` argument containing outcome, reason, puzzle/actor identifiers, solved counts/IDs, and GM-preview state.
+- Added a one-shot guard so the close hook cannot fire twice for the same player app instance.
+- Added `relationships.systems` for `cyberpunk-red-core` with minimum/verified `0.92.1`, plus a recommendation for Monk's Active Tile Triggers.
+- Synchronized the manifest and README to v1.0.5 verification-candidate status.
+- No puzzle-data or Tile-binding migration is required.
+
 ## 1.0.4 — 2026-08-14
 
 Helper Macro icon path hotfix.
@@ -90,3 +104,4 @@ First stable release.
 ## 0.1.x
 
 - Initial Foundry-native proof of concept.
+
