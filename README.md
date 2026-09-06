@@ -1,108 +1,214 @@
 # Hexcode-Breach-Lite
-A lightweight Cyberpunk-style hexcode breach minigame for Foundry VTT v12 and Cyberpunk RED v0.92.1. Create scene-local puzzle libraries, strict Netrunner role access, customizable grid and buffers, repeatable hexcodes, audited emergency resets, and custom rewards.
 
-Module assisted with AI. Legacy Proof of concept Macro found at Cyberpunk Red Foundry VTT shared content discord. 
+A lightweight Cyberpunk-style breach-protocol minigame for **Foundry VTT v12** and the **Cyberpunk RED Core** system.
 
-## Verification candidate: v1.0.5
+Hexcode Breach Lite lets a GM build reusable breach puzzles, bind them to Tiles, restrict live access to Netrunners, and attach Eurobuck, Item, or RollTable rewards to individual sequences.
 
-Originally released stable on **2026-08-02** after successful live testing with separate Gamemaster and player accounts. **v1.0.5 (verification candidate, 2026-08-28)** builds on the validated v1.0.4 helper/icon behavior and adds an explicit companion-module outcome contract for CitiNet-style Hexcode locks. This candidate is not stamped as a new stable release until live audit/testing is complete; no puzzle-data migration is required.
+> **v1.1.0 stable:** adds optional Portable (World) puzzles, fresh per-attempt matrices, one-time GM-authoritative reward claims, and reliable player-account reward delivery. The breach interaction loop remains the simple v1.0.5-proven click/validate/update/render model, while portability and reward bookkeeping stay outside that critical path.
 
-### Core features
+## Requirements
 
-- Scene-local breach puzzle libraries and Tile bindings.
-- Strict Netrunner-only live access using the Netrunner Role or Interface Role Ability.
-- Explicit **Save + GM Preview** bypass for Gamemaster testing only.
-- Custom / Current grids from **4×4 through 8×8**.
-- Custom buffers from **4 through 14**.
-- Editable named templates.
-- Repeatable hexcodes inside ordered sequences.
-- Timer begins on the first valid hexcode selection.
-- A single cracked sequence secures **partial success**; cracking every configured sequence is **full success**.
-- One-use Emergency Reset that clears the current buffer, rebuilds the matrix, halves remaining time, and records the reset in chat.
-- Eurobuck, Item, and RollTable data rewards.
-- Drag-and-drop and searchable Item / RollTable selection.
-- Player-visible reward names before the breach is completed.
-- Verified puzzle, sequence, and stale Tile-binding deletion.
-- Public chat progress and final breach results.
-- No audio assets or required compendium packs.
+- Foundry Virtual Tabletop **v12.343**
+- Cyberpunk RED Core **v0.92.1**
+- **Recommended:** Monk's Active Tile Triggers for click-to-open Tile automation
 
-## Compatibility
+No compendium packs or audio assets are required.
 
-- Foundry Virtual Tabletop: **v12.343**
-- Cyberpunk RED system: **v0.92.1**
-- Monk's Active Tiles: supported through the generated helper Macro and scene-bound Tile flags.
+## Quick Start
+
+1. Enable **Hexcode Breach Lite** in your Cyberpunk RED world.
+2. As GM, open **Token Controls → Hexcode Breach Lite**.
+3. Create or load a breach, configure its grid, buffer, timer, sequences, and rewards.
+4. Choose a **Storage Scope**:
+   - **Scene-local** — fixed to the active Scene.
+   - **Portable (World)** — available from any Scene.
+5. Press **Save Puzzle**.
+6. Select the Tile that represents the terminal/device and press **Bind Selected Tile**.
+7. Press **Create Helper Macro** once, then add that Macro to a Monk's **Run Macro** Tile action. Leave Monk's Arguments blank.
+8. Trigger the Tile with a Netrunner Actor.
+
+The generated helper Macro is universal. You do **not** hard-code a puzzle ID into each Tile.
+
+## Scene-local vs Portable
+
+| Scope | Best for | What happens when the Tile moves? |
+|---|---|---|
+| **Scene-local** | Doors, cameras, fixed terminals, building networks | The binding remains locked to that Scene. |
+| **Portable (World)** | Stolen laptops, carried devices, mobile terminals, recurring props | The same puzzle can be opened from any Scene. A copied/duplicated Tile keeps working when its Hexcode binding flags are preserved. |
+
+A Portable puzzle is stored in Hexcode Breach Lite's hidden **world-level puzzle library** instead of Scene flags.
+
+If you change a saved puzzle from Scene-local to Portable, Hexcode now shows the move as **pending** until you press Save, then confirms the conversion, moves the puzzle into the Portable World Library, upgrades matching bindings, and carries one-time reward claims with it. Moving Portable back to Scene-local likewise requires confirmation; bindings on the active Scene are converted and off-scene portable bindings are removed.
+
+### Example: stolen laptop
+
+1. Create `Stolen Arasaka Laptop`.
+2. Set **Storage Scope → Portable (World)**.
+3. Save it and bind the laptop Tile.
+4. When the crew takes the laptop elsewhere, copy/duplicate that bound Tile to the new Scene, or bind a new Tile to the same Portable puzzle.
+5. The Netrunner sees the same breach definition and rewards without rebuilding it on every map. The **matrix itself is freshly randomized for each live breach attempt**, so moving the laptop—or simply attempting it again—does not preserve a memorized path.
+
+## Breach Rules
+
+- First selection must be from the **top row**.
+- Valid selections then alternate **column → row → column → row**.
+- The timer starts on the **first valid hex selection**, not when the window opens.
+- Grid size: **4×4 through 8×8**.
+- Buffer size: **4 through 14**.
+- Hex values: `1C`, `55`, `BD`, `E9`, `7A`, `FF`.
+- Repeated hexcodes are allowed inside a sequence.
+- A single cracked sequence secures a **partial success** and its rewards.
+- Cracking every configured sequence is a **full success**.
+- Every live breach attempt receives a **fresh randomized matrix**. The saved GM matrix is a preview/sample, not a permanent player path.
+- One Emergency Reset is allowed per run. It clears the current buffer, rebuilds the matrix again, preserves already-secured sequences, and halves the remaining timer.
+
+
+### Player-loop architecture (v1.1.0)
+
+The breach matrix intentionally uses the same simple interaction model proven in v1.0.5: click → validate → update buffer/path → detect sequences → normal Foundry render. Portable storage, reward claims, socket verification, and chat posting are bookkeeping around that loop rather than part of it. A fresh runtime matrix is generated once before each player window opens and is not regenerated by Application rerenders.
+
+## Access Control
+
+Live breaches require an Actor with either:
+
+- the **Netrunner** Role, or
+- the **Interface** Role Ability.
+
+GM status does not bypass a live Tile activation. Use **Save + GM Preview** from the GM window when you need to test a puzzle without a Netrunner.
+
+## Rewards
+
+Each sequence may grant any combination of:
+
+- Eurobucks
+- an Item
+- a RollTable data result
+
+Items and RollTables can be dragged into the GM window or selected with the built-in browsers.
+
+Configured payloads are **one-time by default**. Once a sequence pays out, Hexcode records a GM-authoritative claim tied to that puzzle/sequence, so reopening the same laptop, terminal, or portable device does not respawn its Eurobucks, Item, or RollTable data. The sequence can still be cracked again; only the already-extracted payload is withheld.
+
+Enable **Repeatable payload** on a sequence only when the GM intentionally wants that reward/data to be available every time. The GM editor also shows one-time claim counts and provides **Reset Reward Claims** for deliberate re-arming/testing. **Save + GM Preview never grants or consumes rewards.**
+
+### Player-account reward delivery (v1.1.0)
+
+One-time payload claims are GM-authoritative. A player client cracks the sequence immediately, then sends a reward request over Foundry's package socket to an active GM. The GM verifies the stored puzzle/sequence, resolves the receiving Actor, grants the Item/Eurobucks/data, records the claim, and returns the result to the player.
+
+Because the package socket namespace is declared in `module.json`, **fully restart Foundry after installing or updating Hexcode Breach Lite** before testing player rewards. This is especially important when upgrading from v1.0.5 or any pre-beta.6 test build.
+
+## Monk's Active Tile Triggers
+
+Press **Create Helper Macro** in the GM window. Hexcode creates or repairs:
+
+`Hexcode Breach — Open Bound Tile`
+
+Use that Macro in a Monk's **Run Macro** action and leave the Monk's Arguments field blank.
+
+The helper forwards the triggering Tile, Token, Actor, and Monk's context to Hexcode Breach Lite. The Tile's Hexcode binding decides which puzzle and storage scope to open.
+
+## Installing from GitHub
+
+Repository: **LtAtasEDO/Hexcode-Breach-Lite**
+
+### Foundry manifest install — stable releases
+
+When a GitHub release includes both `module.json` and `module.zip`, paste this URL into Foundry's **Install Module → Manifest URL** field:
+
+```text
+https://github.com/LtAtasEDO/Hexcode-Breach-Lite/releases/latest/download/module.json
+```
+
+Beta builds may be distributed for manual testing before they are promoted to the repository's latest stable release.
+
+### Manual install
+
+1. Download `module.zip` from the desired GitHub Release.
+2. Shut Foundry down completely.
+3. Remove any old `Data/modules/hexcode-breach-lite/` folder when upgrading from an older or suspicious install.
+4. Extract the release so the final path is:
+
+```text
+FoundryVTT/Data/modules/hexcode-breach-lite/module.json
+```
+
+5. Start Foundry and enable **Hexcode Breach Lite** in your world.
+
+Do not install it one folder too deep. This is wrong:
+
+```text
+Data/modules/hexcode-breach-lite/hexcode-breach-lite/module.json
+```
+
+### Upgrade troubleshooting
+
+If Foundry reports the wrong Hexcode version, the API is missing, mystery `packs` folders appear, or behavior does not match the new release:
+
+1. Fully shut down Foundry.
+2. Confirm no Foundry/Node process remains running.
+3. Delete the entire `Data/modules/hexcode-breach-lite/` folder.
+4. Install a fresh **Full Module** build.
+5. Restart Foundry.
+
+Overlaying new files can leave stale module content behind.
 
 ## API
 
 ```js
 game.modules.get("hexcode-breach-lite").api.openGM();
+
+// Backward-compatible lookup: active Scene first, then Portable World Library.
 await game.modules.get("hexcode-breach-lite").api.openPuzzle("PUZZLE_ID");
+
+// Explicit portable puzzle.
+await game.modules.get("hexcode-breach-lite").api.openPuzzle("PUZZLE_ID", { scope: "world" });
+
+// Monk's / bound-Tile entry point.
 await game.modules.get("hexcode-breach-lite").api.openBound(typeof args === "undefined" ? null : args);
+
+// Library inspection.
+await game.modules.get("hexcode-breach-lite").api.listScenePuzzles();
+await game.modules.get("hexcode-breach-lite").api.listWorldPuzzles();
 ```
 
-`openPuzzle` is a live entry point and requires a verified Netrunner Actor. Use **Save + GM Preview** in the GM editor for role-bypassed testing.
+`openPuzzle()` is still a live entry point and enforces Netrunner access.
 
-## Install
+## Companion-module / CitiNet result hook
 
-Place the module contents directly in:
-
-```text
-FoundryVTT/Data/modules/hexcode-breach-lite/
-```
-
-The `module.json`, `scripts`, `styles`, and `templates` entries must all be directly inside that folder.
-
-## Monk's Active Tiles helper
-
-Use the GM window's **Create Helper Macro** button, then execute that Macro from the bound Tile. The generated Script Macro is intentionally patterned after the working Vendit-style helper and calls the module API directly instead of depending on the `game.hexcodebreach` compatibility alias:
-
-```js
-const hbl = game.modules.get("hexcode-breach-lite")?.api;
-if (!hbl) return ui.notifications.error("Hexcode Breach Lite API is not available. Confirm the module is enabled, then restart Foundry.");
-return hbl.openBound({
-  args: typeof args === "undefined" ? null : args,
-  tile: typeof tile === "undefined" ? null : tile,
-  token: typeof token === "undefined" ? null : token,
-  actor: typeof actor === "undefined" ? null : actor
-});
-```
-
-Select the Tile with Foundry Tile Controls and press **Bind Selected Tile** in the GM window. The binding stores both the active Scene ID and breach puzzle ID on the Tile. Monk's Active Tile Triggers v12 supplies the triggering Tile, Token, Actor, and action arguments to Script Macros. The helper forwards those values directly to `module.api.openBound()` so no puzzle ID needs to be hard-coded. Leave the Monk's argument field blank for Tile-bound puzzles.
-
-If a helper Macro from v1.0.1 or v1.0.2 was manually edited and Foundry reports a Macro Joint Validation error, delete that helper Macro and use **Create Helper Macro** once to create a clean v1.0.3 copy.
-
-
-## Companion-module / CitiNet close hook
-
-When the player breach window has actually closed, Hexcode Breach Lite fires:
-
-```js
-Hooks.callAll("closeHBLPlayerApp", app, resultData);
-```
-
-`app` remains the first argument for compatibility. Companion modules should use `resultData` for the unambiguous final state:
-
-- `outcome: "success"` — every configured sequence was cracked.
-- `outcome: "partial"` — one or more sequences were cracked, but not all. This includes intentionally completing early, timer/buffer resolution after securing a sequence, or manually closing after securing a sequence.
-- `outcome: "failure"` — the breach formally ended with no secured sequence.
-- `outcome: "aborted"` — the player manually closed the breach before securing any sequence.
-
-The payload also includes `reason`, `puzzleId`, `puzzleName`, `actorId`, `actorUuid`, `solvedCount`, `totalSequences`, `solvedSequenceIds`, and `gmPreview`. A CitiNet listener should explicitly decide whether a particular lock accepts `partial`; it should also ignore `gmPreview: true` for live unlocks.
-
-Example:
+After the player breach window actually closes:
 
 ```js
 Hooks.on("closeHBLPlayerApp", (app, result) => {
-  if (result.gmPreview) return;
-  if (result.outcome === "success") {
-    // Full-success unlock.
-  }
-  if (result.outcome === "partial") {
-    // Optional partial-success handling for this specific CitiNet lock.
-  }
+  console.log(result.outcome, result.puzzleScope);
 });
 ```
 
-## Storage model
+`result.outcome` is one of:
 
-The module does not require a compendium pack. Saved puzzles are stored in Scene flags, and Tile bindings are stored on the bound Tile. Each breach therefore remains specific to its Scene.
+- `success` — every configured sequence was cracked.
+- `partial` — at least one but not all sequences were cracked.
+- `failure` — the breach formally ended with no secured sequence.
+- `aborted` — the player manually closed before securing a sequence.
+
+The result payload includes:
+
+`reason`, `puzzleId`, `puzzleName`, `puzzleScope`, `sceneId`, `actorId`, `actorUuid`, `solvedCount`, `totalSequences`, `solvedSequenceIds`, and `gmPreview`.
+
+Companion modules should ignore `gmPreview: true` for live unlocks.
+
+## Storage Model
+
+- **Scene-local puzzles:** Scene flag `flags.hexcode-breach-lite.puzzles`
+- **Portable puzzles:** hidden world setting managed by Hexcode Breach Lite
+- **One-time reward claims:** hidden GM-authoritative world setting managed by Hexcode Breach Lite
+- **Tile bindings:** Tile flag `flags.hexcode-breach-lite.binding`
+
+Older bindings without an explicit scope are treated as **Scene-local**, so v1.0.5 worlds do not require a data migration.
+
+## Credits
+
+Created by **Lt Atlas** for Cyberpunk RED on Foundry VTT, with development assistance from AI. Legacy Proof of concept Macro found at Cyberpunk Red Foundry VTT shared content discord. 
+
+The original breach-protocol concept was inspired by community proof-of-concept work and the Cyberpunk Breach Protocol project:
+https://github.com/Alexkill536ITA/cyberpunk-breach-protocol/releases/tag/Release-V1.1.0
+
+This project is unofficial fan tooling and is not affiliated with R. Talsorian Games, Foundry Gaming LLC, or CD PROJEKT RED.
