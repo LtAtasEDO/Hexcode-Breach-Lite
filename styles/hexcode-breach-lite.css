@@ -882,3 +882,32 @@
   color: #fff56a;
   text-align: center;
 }
+
+/* v1.1.0-beta.2 — portable conversion state and one-time payload claims. */
+.hbl-scope-warning {
+  margin: 8px 0 0;
+  padding: 7px 9px;
+  color: #fff36a;
+  border: 1px solid rgba(255, 233, 74, 0.62);
+  background: rgba(255, 233, 74, 0.08);
+}
+
+.hbl-reward-claims-panel {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  border-color: rgba(0, 229, 255, 0.62);
+}
+
+.hbl-repeatable-reward {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(0, 229, 255, 0.22);
+}
+
+@media (max-width: 760px) {
+  .hbl-reward-claims-panel {
+    grid-template-columns: 1fr;
+  }
+}
