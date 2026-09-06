@@ -1,6 +1,10 @@
 const HBL_ID = "hexcode-breach-lite";
 const HBL_FLAG_PUZZLES = "puzzles";
 const HBL_FLAG_BINDING = "binding";
+const HBL_SETTING_WORLD_PUZZLES = "worldPuzzles";
+const HBL_SETTING_REWARD_CLAIMS = "rewardClaims";
+const HBL_SOCKET = `module.${HBL_ID}`;
+const HBL_REWARD_REQUEST_TIMEOUT = 10000;
 const HBL_ROLE_DENIAL_COOLDOWN = 4000;
 
 function hblClone(obj) {
@@ -35,6 +39,11 @@ function hblGetForm(html) {
 const HBL = {
   DEFAULT_HEX: ["1C", "55", "BD", "E9", "7A", "FF"],
   roleDenialCache: new Map(),
+  pendingRewardRequests: new Map(),
+
+  normalizeStorageScope(value) {
+    return String(value || "scene").toLowerCase() === "world" ? "world" : "scene";
+  },
 
   documentReference(doc) {
     if (!doc) return "";
@@ -65,6 +74,21 @@ const HBL = {
       }
     }
     return puzzle;
+  },
+
+  async prepareRuntimePuzzle(puzzle, { randomizeMatrix = true } = {}) {
+    // Build one finalized runtime snapshot before the player Application starts
+    // rendering. Portable storage and reward bookkeeping remain outside the
+    // matrix interaction loop, matching the proven v1.0.5 architecture.
+    let runtime = this.normalizePuzzle(hblClone(puzzle));
+    runtime = await this.resolvePayloadNames(runtime);
+    if (randomizeMatrix) runtime.matrix = this.generateMatrix(runtime.gridSize, runtime.hexPool);
+    runtime.sequences = runtime.sequences.map(sequence => ({
+      ...sequence,
+      solved: false,
+      rewardGranted: false
+    }));
+    return runtime;
   },
 
   TEMPLATES: {
@@ -127,6 +151,7 @@ const HBL = {
       rewardName: String(data.rewardName || ""),
       rollTableRef: String(data.rollTableRef || data.rollTable || ""),
       rollTableName: String(data.rollTableName || ""),
+      repeatableReward: Boolean(data.repeatableReward),
       solved: Boolean(data.solved),
       rewardGranted: Boolean(data.rewardGranted)
     };
@@ -153,6 +178,7 @@ const HBL = {
       bufferSize: template.bufferSize,
       timerSeconds: template.timerSeconds,
       publicProgress: overrides.publicProgress ?? true,
+      storageScope: this.normalizeStorageScope(overrides.storageScope),
       hexPool,
       matrix: [],
       sequences,
@@ -173,6 +199,7 @@ const HBL = {
     base.bufferSize = Math.clamp(hblNumber(base.bufferSize, 6), 4, 14);
     base.timerSeconds = Math.clamp(hblNumber(base.timerSeconds, 60), 0, 600);
     base.publicProgress = base.publicProgress !== false;
+    base.storageScope = this.normalizeStorageScope(base.storageScope);
     const storedPool = this.normalizeHexPool(base.hexPool);
     base.sequences = Array.isArray(base.sequences)
       ? base.sequences.map(sequence => this.newSequence(sequence)).filter(sequence => sequence.code.length)
@@ -255,13 +282,33 @@ const HBL = {
     return doc?.documentName === "Tile" ? hblClone(doc.getFlag(HBL_ID, HBL_FLAG_BINDING) || null) : null;
   },
 
-  getBoundTileCount(puzzleId) {
-    const scene = this.getScene();
-    if (!scene || !puzzleId) return 0;
-    return scene.tiles.filter(tile => {
-      const binding = tile.getFlag(HBL_ID, HBL_FLAG_BINDING);
-      return binding?.sceneId === scene.id && binding?.puzzleId === puzzleId;
-    }).length;
+  getBindingScope(binding) {
+    return this.normalizeStorageScope(binding?.scope);
+  },
+
+  getBindingStats(puzzleId, scope = "scene") {
+    scope = this.normalizeStorageScope(scope);
+    const activeScene = this.getScene();
+    if (!puzzleId) return { current: 0, total: 0 };
+
+    let current = 0;
+    let total = 0;
+    const scenes = scope === "world" ? Array.from(game.scenes ?? []) : (activeScene ? [activeScene] : []);
+    for (const scene of scenes) {
+      for (const tile of scene.tiles ?? []) {
+        const binding = tile.getFlag(HBL_ID, HBL_FLAG_BINDING);
+        if (binding?.puzzleId !== puzzleId) continue;
+        if (this.getBindingScope(binding) !== scope) continue;
+        if (scope === "scene" && binding?.sceneId && binding.sceneId !== scene.id) continue;
+        total += 1;
+        if (scene.id === activeScene?.id) current += 1;
+      }
+    }
+    return { current, total };
+  },
+
+  getBoundTileCount(puzzleId, scope = "scene") {
+    return this.getBindingStats(puzzleId, scope).current;
   },
 
   async bindSelectedTiles(puzzle) {
@@ -273,15 +320,18 @@ const HBL = {
       return ui.notifications.warn("Select one or more Tiles with Foundry's Tile Controls, then press Bind Selected Tile.");
     }
     puzzle = this.normalizePuzzle(puzzle);
+    const scope = this.normalizeStorageScope(puzzle.storageScope);
     const binding = {
-      sceneId: scene.id,
+      scope,
+      sceneId: scope === "scene" ? scene.id : null,
       puzzleId: puzzle.id,
       puzzleName: puzzle.name,
       boundAt: Date.now(),
-      version: 2
+      version: 3
     };
     await Promise.all(tiles.map(tile => tile.setFlag(HBL_ID, HBL_FLAG_BINDING, binding)));
-    ui.notifications.info(`Bound ${tiles.length} tile${tiles.length === 1 ? "" : "s"} to ${puzzle.name} on ${scene.name}.`);
+    const portableText = scope === "world" ? " as a portable world breach" : "";
+    ui.notifications.info(`Bound ${tiles.length} tile${tiles.length === 1 ? "" : "s"} to ${puzzle.name}${portableText} on ${scene.name}.`);
     return tiles.length;
   },
 
@@ -462,13 +512,38 @@ const HBL = {
   },
 
   async openPuzzle(puzzleId = null, options = {}) {
+    const requestedScope = options.scope ? this.normalizeStorageScope(options.scope) : null;
+    let puzzle = puzzleId ? await this.getPuzzle(puzzleId, { scope: requestedScope }) : null;
+
+    if (!puzzleId) {
+      const scenePuzzles = await this.getScenePuzzles();
+      puzzle = Object.values(scenePuzzles)[0] ?? null;
+      if (!puzzle) {
+        const worldPuzzles = await this.getWorldPuzzles();
+        puzzle = Object.values(worldPuzzles)[0] ?? null;
+      }
+    }
+
+    if (!puzzle) {
+      const detail = puzzleId ? `: ${puzzleId}` : "";
+      return ui.notifications.warn(`Hexcode Breach puzzle not found${detail}`);
+    }
+
     const actor = options.actor ?? await this.resolveActorDocument(options.actorUuid) ?? this.getUserActor();
     if (!this.isNetrunner(actor)) {
-      const puzzle = puzzleId ? await this.getPuzzle(puzzleId) : null;
       await this.postRoleDenied(actor, puzzle);
       return null;
     }
-    return new HBLPlayerApp({ puzzleId, actor, gmPreview: false }).render(true);
+
+    const runtimePuzzle = await this.prepareRuntimePuzzle(puzzle);
+    return new HBLPlayerApp({
+      puzzleId: runtimePuzzle.id,
+      puzzleScope: runtimePuzzle.storageScope ?? requestedScope,
+      sceneId: options.sceneId ?? this.getScene()?.id ?? null,
+      runtimePuzzle,
+      actor,
+      gmPreview: false
+    }).render(true);
   },
 
   async openBoundTile(args = null) {
@@ -478,12 +553,16 @@ const HBL = {
     if (!tile) return ui.notifications.warn("Hexcode Breach could not identify the triggering tile.");
     const binding = this.getTileBinding(tile);
     if (!binding?.puzzleId) return ui.notifications.warn("This tile is not bound to a Hexcode Breach puzzle.");
-    if (binding.sceneId && binding.sceneId !== scene.id) {
+
+    const scope = this.getBindingScope(binding);
+    if (scope === "scene" && binding.sceneId && binding.sceneId !== scene.id) {
       return ui.notifications.warn("This Hexcode Breach tile belongs to a different scene.");
     }
-    const puzzle = await this.getPuzzle(binding.puzzleId);
+
+    const puzzle = await this.getPuzzle(binding.puzzleId, { scope });
     if (!puzzle) {
-      return ui.notifications.warn(`Bound breach not found on ${scene.name}: ${binding.puzzleName || binding.puzzleId}`);
+      const where = scope === "world" ? "the Portable World Library" : scene.name;
+      return ui.notifications.warn(`Bound breach not found in ${where}: ${binding.puzzleName || binding.puzzleId}`);
     }
 
     const actor = await this.findTriggerActor(args, { allowUserFallback: false });
@@ -495,7 +574,7 @@ const HBL = {
       await this.postRoleDenied(actor, puzzle);
       return null;
     }
-    return this.openPuzzle(binding.puzzleId, { actor });
+    return this.openPuzzle(binding.puzzleId, { actor, scope });
   },
 
   async createHelperMacro() {
@@ -552,18 +631,25 @@ return hbl.openBound({
     return macro;
   },
 
-  async getScenePuzzles() {
-    const scene = this.getScene();
-    if (!scene) return {};
-    const stored = hblClone(scene.getFlag(HBL_ID, HBL_FLAG_PUZZLES) || {});
-    return Object.fromEntries(Object.entries(stored).map(([id, puzzle]) => [id, this.normalizePuzzle(puzzle)]));
+  resolveScene(sceneRef = null) {
+    if (!sceneRef) return this.getScene();
+    if (sceneRef.documentName === "Scene") return sceneRef;
+    return game.scenes?.get?.(String(sceneRef)) ?? null;
   },
 
-  async replaceScenePuzzles(puzzles = {}) {
-    const scene = this.getScene();
+  async getScenePuzzles(sceneRef = null) {
+    const scene = this.resolveScene(sceneRef);
+    if (!scene) return {};
+    const stored = hblClone(scene.getFlag(HBL_ID, HBL_FLAG_PUZZLES) || {});
+    return Object.fromEntries(Object.entries(stored).map(([id, puzzle]) => {
+      const normalized = this.normalizePuzzle({ ...puzzle, storageScope: "scene" });
+      return [id, normalized];
+    }));
+  },
+
+  async replaceScenePuzzles(puzzles = {}, sceneRef = null) {
+    const scene = this.resolveScene(sceneRef);
     if (!scene) return false;
-    // Foundry document updates merge nested objects. Unsetting first prevents deleted
-    // puzzle IDs from surviving as ghost keys in scene flags.
     await scene.unsetFlag(HBL_ID, HBL_FLAG_PUZZLES);
     if (Object.keys(puzzles).length) {
       await scene.setFlag(HBL_ID, HBL_FLAG_PUZZLES, hblClone(puzzles));
@@ -571,50 +657,330 @@ return hbl.openBound({
     return true;
   },
 
-  async getPuzzle(id) {
-    const puzzles = await this.getScenePuzzles();
-    return puzzles[id] ? hblClone(puzzles[id]) : null;
+  async getWorldPuzzles() {
+    const stored = hblClone(game.settings.get(HBL_ID, HBL_SETTING_WORLD_PUZZLES) || {});
+    return Object.fromEntries(Object.entries(stored).map(([id, puzzle]) => {
+      const normalized = this.normalizePuzzle({ ...puzzle, storageScope: "world" });
+      return [id, normalized];
+    }));
   },
 
-  async savePuzzle(puzzle) {
-    const scene = this.getScene();
-    if (!scene) return ui.notifications.error("No active scene found for Hexcode Breach Lite.");
+  async replaceWorldPuzzles(puzzles = {}) {
+    if (!game.user.isGM) return false;
+    await game.settings.set(HBL_ID, HBL_SETTING_WORLD_PUZZLES, hblClone(puzzles));
+    return true;
+  },
+
+  async getPuzzles(scope = "scene", options = {}) {
+    return this.normalizeStorageScope(scope) === "world"
+      ? this.getWorldPuzzles()
+      : this.getScenePuzzles(options?.sceneId ?? null);
+  },
+
+  async getPuzzle(id, options = {}) {
+    if (!id) return null;
+    const requested = typeof options === "string" ? options : options?.scope;
+    const sceneId = typeof options === "object" ? options?.sceneId : null;
+    if (requested) {
+      const scope = this.normalizeStorageScope(requested);
+      const puzzles = await this.getPuzzles(scope, { sceneId });
+      return puzzles[id] ? hblClone(puzzles[id]) : null;
+    }
+
+    // Backward-compatible lookup: old API calls search the requested/active Scene first,
+    // then the Portable World Library. Tile bindings always provide an explicit scope.
+    const scenePuzzles = await this.getScenePuzzles(sceneId);
+    if (scenePuzzles[id]) return hblClone(scenePuzzles[id]);
+    const worldPuzzles = await this.getWorldPuzzles();
+    return worldPuzzles[id] ? hblClone(worldPuzzles[id]) : null;
+  },
+
+  getPrimaryActiveGM() {
+    return Array.from(game.users ?? [])
+      .filter(user => user?.active && user?.isGM)
+      .sort((a, b) => String(a.id).localeCompare(String(b.id)))[0] ?? null;
+  },
+
+  async getRewardClaims() {
+    return hblClone(game.settings.get(HBL_ID, HBL_SETTING_REWARD_CLAIMS) || {});
+  },
+
+  async replaceRewardClaims(claims = {}) {
+    if (!game.user.isGM) return false;
+    await game.settings.set(HBL_ID, HBL_SETTING_REWARD_CLAIMS, hblClone(claims));
+    return true;
+  },
+
+  sequenceHasRewards(sequence) {
+    return Boolean(Math.trunc(hblNumber(sequence?.eurobucks, 0)) || sequence?.rewardUuid || sequence?.rollTableRef);
+  },
+
+  rewardClaimKey(puzzleId, sequenceId, scope = "scene", sceneId = null) {
+    scope = this.normalizeStorageScope(scope);
+    if (scope === "world") return `world:${puzzleId}:${sequenceId}`;
+    return `scene:${sceneId || this.getScene()?.id || "unknown"}:${puzzleId}:${sequenceId}`;
+  },
+
+  rewardClaimPrefix(puzzleId, scope = "scene", sceneId = null) {
+    scope = this.normalizeStorageScope(scope);
+    if (scope === "world") return `world:${puzzleId}:`;
+    return `scene:${sceneId || this.getScene()?.id || "unknown"}:${puzzleId}:`;
+  },
+
+  async getRewardClaimStats(puzzle, sceneId = null) {
+    puzzle = this.normalizePuzzle(puzzle);
+    const oneTime = puzzle.sequences.filter(sequence => this.sequenceHasRewards(sequence) && !sequence.repeatableReward);
+    const claims = await this.getRewardClaims();
+    const claimed = oneTime.filter(sequence => {
+      const key = this.rewardClaimKey(puzzle.id, sequence.id, puzzle.storageScope, sceneId);
+      return claims[key]?.status === "claimed";
+    }).length;
+    return { claimed, total: oneTime.length };
+  },
+
+  async clearRewardClaimsForPuzzle(puzzleId, scope = "scene", sceneId = null) {
+    if (!game.user.isGM || !puzzleId) return 0;
+    const claims = await this.getRewardClaims();
+    const prefix = this.rewardClaimPrefix(puzzleId, scope, sceneId);
+    let removed = 0;
+    for (const key of Object.keys(claims)) {
+      if (!key.startsWith(prefix)) continue;
+      delete claims[key];
+      removed += 1;
+    }
+    if (removed) await this.replaceRewardClaims(claims);
+    return removed;
+  },
+
+  async migrateRewardClaimsForScopeChange(puzzleId, fromScope, toScope, sceneId = null) {
+    if (!game.user.isGM || !puzzleId) return 0;
+    fromScope = this.normalizeStorageScope(fromScope);
+    toScope = this.normalizeStorageScope(toScope);
+    if (fromScope === toScope) return 0;
+    const claims = await this.getRewardClaims();
+    const oldPrefix = this.rewardClaimPrefix(puzzleId, fromScope, sceneId);
+    let moved = 0;
+    for (const [key, value] of Object.entries({ ...claims })) {
+      if (!key.startsWith(oldPrefix)) continue;
+      const sequenceId = key.slice(oldPrefix.length);
+      const newKey = this.rewardClaimKey(puzzleId, sequenceId, toScope, sceneId);
+      if (!claims[newKey]) claims[newKey] = value;
+      delete claims[key];
+      moved += 1;
+    }
+    if (moved) await this.replaceRewardClaims(claims);
+    return moved;
+  },
+
+  async requestSequenceReward({ puzzleId, puzzleScope, sceneId, sequenceId, actorUuid, actorId }) {
+    const payload = {
+      puzzleId,
+      puzzleScope: this.normalizeStorageScope(puzzleScope),
+      sceneId,
+      sequenceId,
+      actorUuid,
+      actorId
+    };
+    if (game.user.isGM) return this.processSequenceRewardRequest(payload);
+
+    const gm = this.getPrimaryActiveGM();
+    if (!gm) {
+      return {
+        ok: false,
+        html: `<div class="hbl-chat-rewards"><b>PAYLOAD:</b><ul><li class="hbl-reward-warn">Reward could not be verified because no GM is currently connected. No payload was granted.</li></ul></div>`
+      };
+    }
+
+    const requestId = hblRandomId();
+    return new Promise(resolve => {
+      const timeout = window.setTimeout(() => {
+        this.pendingRewardRequests.delete(requestId);
+        resolve({
+          ok: false,
+          html: `<div class="hbl-chat-rewards"><b>PAYLOAD:</b><ul><li class="hbl-reward-warn">Reward verification timed out. No payload was granted.</li></ul></div>`
+        });
+      }, HBL_REWARD_REQUEST_TIMEOUT);
+      this.pendingRewardRequests.set(requestId, { resolve, timeout });
+      game.socket.emit(HBL_SOCKET, {
+        type: "reward-request",
+        requestId,
+        senderId: game.user.id,
+        targetGMId: gm.id,
+        payload
+      });
+    });
+  },
+
+  async processSequenceRewardRequest(payload = {}) {
+    if (!game.user.isGM) return { ok: false, html: "" };
+    const scope = this.normalizeStorageScope(payload.puzzleScope);
+    const sceneId = scope === "scene" ? payload.sceneId : null;
+    const puzzle = await this.getPuzzle(payload.puzzleId, { scope, sceneId });
+    if (!puzzle) return { ok: false, html: `<div class="hbl-chat-rewards"><b>PAYLOAD:</b><ul><li class="hbl-reward-warn">Reward source puzzle could not be verified.</li></ul></div>` };
+    const sequence = puzzle.sequences.find(entry => entry.id === payload.sequenceId);
+    if (!sequence || !this.sequenceHasRewards(sequence)) return { ok: true, html: "" };
+
+    let actor = null;
+    try { actor = payload.actorUuid ? await fromUuid(payload.actorUuid) : null; } catch (_err) { actor = null; }
+    if (!actor && payload.actorId) actor = game.actors?.get(payload.actorId) ?? null;
+
+    if (sequence.repeatableReward) {
+      return this.grantSequenceRewardsLocal(actor, sequence, puzzle);
+    }
+
+    const claims = await this.getRewardClaims();
+    const key = this.rewardClaimKey(puzzle.id, sequence.id, scope, sceneId);
+    const existing = claims[key];
+    const now = Date.now();
+    if (existing?.status === "claimed" || (existing?.status === "pending" && now - Number(existing.at || 0) < 300000)) {
+      return {
+        ok: true,
+        alreadyClaimed: true,
+        html: `<div class="hbl-chat-rewards"><b>PAYLOAD:</b><ul><li class="hbl-reward-warn">Payload already extracted from this breach. The sequence can still be cracked, but its loot does not respawn.</li></ul></div>`
+      };
+    }
+
+    claims[key] = {
+      status: "pending",
+      at: now,
+      actorUuid: actor?.uuid ?? payload.actorUuid ?? null,
+      actorName: actor?.name ?? null,
+      puzzleId: puzzle.id,
+      sequenceId: sequence.id
+    };
+    await this.replaceRewardClaims(claims);
+
+    const result = await this.grantSequenceRewardsLocal(actor, sequence, puzzle);
+    const refreshed = await this.getRewardClaims();
+    if (result.anySuccess) {
+      refreshed[key] = { ...claims[key], status: "claimed", claimedAt: Date.now() };
+    } else {
+      delete refreshed[key];
+    }
+    await this.replaceRewardClaims(refreshed);
+    return result;
+  },
+
+  async migrateBindingsForScopeChange(puzzleId, fromScope, toScope, puzzleName = "Hexcode Breach") {
+    fromScope = this.normalizeStorageScope(fromScope);
+    toScope = this.normalizeStorageScope(toScope);
+    if (fromScope === toScope || !puzzleId) return { updated: 0, removed: 0 };
+
+    const activeScene = this.getScene();
+    let updated = 0;
+    let removed = 0;
+    for (const scene of game.scenes ?? []) {
+      for (const tile of scene.tiles ?? []) {
+        const binding = tile.getFlag(HBL_ID, HBL_FLAG_BINDING);
+        if (binding?.puzzleId !== puzzleId) continue;
+        if (this.getBindingScope(binding) !== fromScope) continue;
+
+        if (toScope === "world") {
+          await tile.setFlag(HBL_ID, HBL_FLAG_BINDING, {
+            ...binding,
+            scope: "world",
+            sceneId: null,
+            puzzleName,
+            version: 3
+          });
+          updated += 1;
+        } else if (scene.id === activeScene?.id) {
+          await tile.setFlag(HBL_ID, HBL_FLAG_BINDING, {
+            ...binding,
+            scope: "scene",
+            sceneId: scene.id,
+            puzzleName,
+            version: 3
+          });
+          updated += 1;
+        } else {
+          await tile.unsetFlag(HBL_ID, HBL_FLAG_BINDING);
+          removed += 1;
+        }
+      }
+    }
+    return { updated, removed };
+  },
+
+  async savePuzzle(puzzle, { scope = null, previousScope = null } = {}) {
     if (!game.user.isGM) return ui.notifications.warn("Only the GM can save breach puzzles.");
     puzzle = await this.resolvePayloadNames(puzzle);
     puzzle.id ||= hblRandomId();
+    const targetScope = this.normalizeStorageScope(scope ?? puzzle.storageScope);
+    const oldScope = previousScope ? this.normalizeStorageScope(previousScope) : null;
+    if (targetScope === "scene" && !this.getScene()) {
+      return ui.notifications.error("No active scene found for a scene-local Hexcode Breach.");
+    }
+
+    puzzle.storageScope = targetScope;
     puzzle.updatedAt = Date.now();
-    const puzzles = await this.getScenePuzzles();
+
+    if (oldScope && oldScope !== targetScope) {
+      const oldPuzzles = await this.getPuzzles(oldScope);
+      if (oldPuzzles[puzzle.id]) {
+        delete oldPuzzles[puzzle.id];
+        if (oldScope === "world") await this.replaceWorldPuzzles(oldPuzzles);
+        else await this.replaceScenePuzzles(oldPuzzles);
+      }
+    }
+
+    const puzzles = await this.getPuzzles(targetScope);
     puzzles[puzzle.id] = hblClone(puzzle);
-    await this.replaceScenePuzzles(puzzles);
-    ui.notifications.info(`Saved breach: ${puzzle.name}`);
+    if (targetScope === "world") await this.replaceWorldPuzzles(puzzles);
+    else await this.replaceScenePuzzles(puzzles);
+
+    let migration = { updated: 0, removed: 0 };
+    let migratedClaims = 0;
+    if (oldScope && oldScope !== targetScope) {
+      migration = await this.migrateBindingsForScopeChange(puzzle.id, oldScope, targetScope, puzzle.name);
+      migratedClaims = await this.migrateRewardClaimsForScopeChange(puzzle.id, oldScope, targetScope, this.getScene()?.id ?? null);
+    }
+
+    const scopeLabel = targetScope === "world" ? "Portable World Library" : this.getScene()?.name || "Scene";
+    const migrationText = migration.updated || migration.removed || migratedClaims
+      ? ` Updated ${migration.updated} binding${migration.updated === 1 ? "" : "s"}${migration.removed ? ` and removed ${migration.removed} off-scene binding${migration.removed === 1 ? "" : "s"}` : ""}${migratedClaims ? `; preserved ${migratedClaims} reward claim${migratedClaims === 1 ? "" : "s"}` : ""}.`
+      : "";
+    ui.notifications.info(`Saved breach to ${scopeLabel}: ${puzzle.name}.${migrationText}`);
     return puzzle;
   },
 
-  async deletePuzzle(id) {
+  async deletePuzzle(id, { scope = "scene" } = {}) {
+    scope = this.normalizeStorageScope(scope);
     const scene = this.getScene();
-    if (!scene || !game.user.isGM || !id) return { ok: false, removedBindings: 0 };
-    const puzzles = await this.getScenePuzzles();
+    if (!game.user.isGM || !id) return { ok: false, removedBindings: 0 };
+    if (scope === "scene" && !scene) return { ok: false, removedBindings: 0 };
+
+    const puzzles = await this.getPuzzles(scope);
     const existing = puzzles[id] ?? null;
     const name = existing?.name || "Hexcode Breach";
     delete puzzles[id];
-    await this.replaceScenePuzzles(puzzles);
+    if (scope === "world") await this.replaceWorldPuzzles(puzzles);
+    else await this.replaceScenePuzzles(puzzles);
 
-    const boundTiles = scene.tiles.filter(tile => {
-      const binding = tile.getFlag(HBL_ID, HBL_FLAG_BINDING);
-      return binding?.puzzleId === id;
-    });
+    const boundTiles = [];
+    const scenes = scope === "world" ? Array.from(game.scenes ?? []) : [scene];
+    for (const candidateScene of scenes) {
+      for (const tile of candidateScene?.tiles ?? []) {
+        const binding = tile.getFlag(HBL_ID, HBL_FLAG_BINDING);
+        if (binding?.puzzleId !== id) continue;
+        if (this.getBindingScope(binding) !== scope) continue;
+        boundTiles.push(tile);
+      }
+    }
     await Promise.all(boundTiles.map(tile => tile.unsetFlag(HBL_ID, HBL_FLAG_BINDING)));
 
-    const verifyPuzzles = await this.getScenePuzzles();
+    const verifyPuzzles = await this.getPuzzles(scope);
     const stillExists = Boolean(verifyPuzzles[id]);
-    const remainingBindings = scene.tiles.filter(tile => tile.getFlag(HBL_ID, HBL_FLAG_BINDING)?.puzzleId === id);
-    if (stillExists || remainingBindings.length) {
-      console.error(`${HBL_ID} | Puzzle deletion verification failed`, { id, stillExists, remainingBindings });
+    const stats = this.getBindingStats(id, scope);
+    if (stillExists || stats.total) {
+      console.error(`${HBL_ID} | Puzzle deletion verification failed`, { id, scope, stillExists, stats });
       ui.notifications.error(`Could not fully delete ${name}. Check the F12 console.`);
       return { ok: false, removedBindings: boundTiles.length };
     }
 
-    ui.notifications.info(`Deleted ${name}${boundTiles.length ? ` and removed ${boundTiles.length} tile binding${boundTiles.length === 1 ? "" : "s"}` : ""}.`);
+    const removedClaims = await this.clearRewardClaimsForPuzzle(id, scope, scene?.id ?? null);
+    const scopeText = scope === "world" ? "Portable World Library" : scene?.name || "this scene";
+    ui.notifications.info(`Deleted ${name} from ${scopeText}${boundTiles.length ? ` and removed ${boundTiles.length} tile binding${boundTiles.length === 1 ? "" : "s"}` : ""}${removedClaims ? ` plus ${removedClaims} reward claim${removedClaims === 1 ? "" : "s"}` : ""}.`);
     return { ok: true, removedBindings: boundTiles.length };
   },
 
@@ -636,7 +1002,7 @@ return hbl.openBound({
     if (!rewardUuid) return null;
     if (!actor) return { ok: false, text: "Item reward could not be awarded: no actor selected." };
     try {
-      if (!actor.isOwner) return { ok: false, text: "Item reward found, but this user cannot update the actor inventory." };
+      if (!game.user.isGM && !actor.isOwner) return { ok: false, text: "Item reward found, but this user cannot update the actor inventory." };
       const doc = await fromUuid(rewardUuid);
       if (!doc || doc.documentName !== "Item") throw new Error("UUID did not resolve to an Item.");
       const itemData = doc.toObject();
@@ -654,7 +1020,7 @@ return hbl.openBound({
     if (!delta) return null;
     if (!actor) return { ok: false, text: "Eurobuck reward could not be awarded: no actor selected." };
     try {
-      if (!actor.isOwner) return { ok: false, text: "Eurobuck reward found, but this user cannot update the actor ledger." };
+      if (!game.user.isGM && !actor.isOwner) return { ok: false, text: "Eurobuck reward found, but this user cannot update the actor ledger." };
       const wealth = hblClone(actor.system?.wealth ?? {});
       const before = hblNumber(wealth.value, 0);
       const after = before + delta;
@@ -721,9 +1087,7 @@ return hbl.openBound({
     }
   },
 
-  async grantSequenceRewards(actor, sequence, puzzle) {
-    if (sequence.rewardGranted) return "";
-    sequence.rewardGranted = true;
+  async grantSequenceRewardsLocal(actor, sequence, puzzle) {
     const rewards = [];
 
     const money = await this.adjustWealth(actor, sequence.eurobucks, `Hexcode Breach: ${sequence.label}`);
@@ -734,16 +1098,40 @@ return hbl.openBound({
 
     const data = await this.drawData(sequence.rollTableRef);
     if (data) {
-      const results = data.results.map(text => `<li>${text}</li>`).join("");
+      const results = data.results.map(text => `<li>${hblEsc(text)}</li>`).join("");
       rewards.push({ ok: data.ok, html: `<b>Data acquired — ${hblEsc(data.tableName)}</b><ul>${results}</ul>` });
     }
 
-    if (!rewards.length) return "";
+    if (!rewards.length) return { ok: true, anySuccess: false, html: "" };
     const rows = rewards.map(reward => {
       if (reward.html) return `<li class="${reward.ok ? "hbl-reward-ok" : "hbl-reward-warn"}">${reward.html}</li>`;
       return `<li class="${reward.ok ? "hbl-reward-ok" : "hbl-reward-warn"}">${hblEsc(reward.text)}</li>`;
     }).join("");
-    return `<div class="hbl-chat-rewards"><b>PAYLOAD:</b><ul>${rows}</ul></div>`;
+    return {
+      ok: true,
+      anySuccess: rewards.some(reward => reward.ok),
+      html: `<div class="hbl-chat-rewards"><b>PAYLOAD:</b><ul>${rows}</ul></div>`
+    };
+  },
+
+  async grantSequenceRewards(actor, sequence, puzzle, options = {}) {
+    if (sequence.rewardGranted) return "";
+    sequence.rewardGranted = true;
+    if (!this.sequenceHasRewards(sequence)) return "";
+
+    if (options.gmPreview) {
+      return `<div class="hbl-chat-rewards"><b>PAYLOAD:</b><ul><li class="hbl-reward-warn">GM Preview is non-destructive. Rewards were not granted or marked as claimed.</li></ul></div>`;
+    }
+
+    const result = await this.requestSequenceReward({
+      puzzleId: puzzle.id,
+      puzzleScope: puzzle.storageScope,
+      sceneId: options.sceneId ?? this.getScene()?.id ?? null,
+      sequenceId: sequence.id,
+      actorUuid: actor?.uuid ?? null,
+      actorId: actor?.id ?? null
+    });
+    return result?.html || "";
   },
 
   async documentFromDrop(event, expectedDocumentName) {
@@ -780,14 +1168,15 @@ return hbl.openBound({
   },
 
   api: {
-    openGM: (id = null) => new HBLGMConfigApp({ puzzleId: id }).render(true),
+    openGM: (id = null, scope = null) => new HBLGMConfigApp({ puzzleId: id, puzzleScope: scope }).render(true),
     openPuzzle: async (id = null, options = {}) => HBL.openPuzzle(id, options),
     openBound: async (args = null) => HBL.openBoundTile(args),
     bindSelectedTiles: async puzzle => HBL.bindSelectedTiles(puzzle),
     unbindSelectedTiles: async () => HBL.unbindSelectedTiles(),
     createHelperMacro: async () => HBL.createHelperMacro(),
-    createRandom: async () => HBL.savePuzzle(HBL.defaultPuzzle()),
+    createRandom: async (scope = "scene") => HBL.savePuzzle(HBL.normalizePuzzle({ ...HBL.defaultPuzzle(), storageScope: scope }), { scope }),
     listScenePuzzles: async () => HBL.getScenePuzzles(),
+    listWorldPuzzles: async () => HBL.getWorldPuzzles(),
     resolveRollTable: async reference => HBL.resolveRollTable(reference),
     isNetrunner: actor => HBL.isNetrunner(actor)
   }
@@ -894,6 +1283,8 @@ class HBLGMConfigApp extends Application {
   constructor(options = {}) {
     super(options);
     this.puzzleId = options.puzzleId ?? null;
+    this.puzzleScope = options.puzzleScope ? HBL.normalizeStorageScope(options.puzzleScope) : null;
+    this.loadedScope = this.puzzleScope;
     this.puzzle = null;
   }
 
@@ -914,20 +1305,68 @@ class HBLGMConfigApp extends Application {
   }
 
   async getData() {
-    const puzzles = await HBL.getScenePuzzles();
-    if (this.puzzleId && puzzles[this.puzzleId]) this.puzzle = HBL.normalizePuzzle(puzzles[this.puzzleId]);
-    else if (!this.puzzle) this.puzzle = HBL.defaultPuzzle();
+    const scenePuzzles = await HBL.getScenePuzzles();
+    const worldPuzzles = await HBL.getWorldPuzzles();
+
+    if (this.puzzleId && !this.puzzle) {
+      let loaded = null;
+      if (this.puzzleScope === "world") loaded = worldPuzzles[this.puzzleId] ?? null;
+      else if (this.puzzleScope === "scene") loaded = scenePuzzles[this.puzzleId] ?? null;
+      else loaded = scenePuzzles[this.puzzleId] ?? worldPuzzles[this.puzzleId] ?? null;
+
+      if (loaded) {
+        this.puzzle = HBL.normalizePuzzle(loaded);
+        this.puzzleScope = this.puzzle.storageScope;
+        this.loadedScope = this.puzzleScope;
+      }
+    }
+
+    if (!this.puzzle) {
+      this.puzzle = HBL.defaultPuzzle();
+      this.puzzleScope = "scene";
+      this.loadedScope = null;
+    }
     this.puzzle = HBL.normalizePuzzle(this.puzzle);
+    this.puzzle.storageScope = HBL.normalizeStorageScope(this.puzzle.storageScope ?? this.puzzleScope);
+    this.puzzleScope = this.puzzle.storageScope;
     await this.resolveRewardNames();
+
+    const persistedScope = this.loadedScope ?? this.puzzle.storageScope;
+    const persistedPuzzleForStats = { ...this.puzzle, storageScope: persistedScope };
+    const bindingStats = HBL.getBindingStats(this.puzzle.id, persistedScope);
+    const rewardClaimStats = await HBL.getRewardClaimStats(persistedPuzzleForStats, HBL.getScene()?.id ?? null);
+    const currentKey = this.puzzleId ? `${persistedScope}::${this.puzzleId}` : "";
+    const scopeChangePending = Boolean(this.puzzleId && this.loadedScope && this.loadedScope !== this.puzzle.storageScope);
+    const mapOption = (puzzle, scope) => ({
+      ...puzzle,
+      selectionKey: `${scope}::${puzzle.id}`,
+      selected: currentKey === `${scope}::${puzzle.id}`
+    });
+    const sortByName = (a, b) => String(a.name).localeCompare(String(b.name));
+    const scopeIsWorld = this.puzzle.storageScope === "world";
 
     return {
       puzzle: this.puzzle,
-      puzzles: Object.values(puzzles).sort((a, b) => String(a.name).localeCompare(String(b.name))),
+      scenePuzzles: Object.values(scenePuzzles).map(p => mapOption(p, "scene")).sort(sortByName),
+      worldPuzzles: Object.values(worldPuzzles).map(p => mapOption(p, "world")).sort(sortByName),
       templates: Object.entries(HBL.TEMPLATES).map(([key, value]) => ({ key, ...value })),
       sceneName: HBL.getScene()?.name ?? "No Active Scene",
-      boundTileCount: HBL.getBoundTileCount(this.puzzle.id),
+      scopeIsWorld,
+      storageScopeLabel: scopeIsWorld ? "Portable (World)" : "Scene-local",
+      boundTileCount: bindingStats.current,
+      boundTileTotal: bindingStats.total,
+      saveButtonLabel: scopeChangePending
+        ? (scopeIsWorld ? "Move to Portable World" : "Move to Current Scene")
+        : (scopeIsWorld ? "Save Portable Puzzle" : "Save to Scene"),
+      scopeChangePending,
+      persistedScopeLabel: persistedScope === "world" ? "Portable (World)" : "Scene-local",
+      rewardClaimedCount: rewardClaimStats.claimed,
+      rewardClaimTotal: rewardClaimStats.total,
+      bindingScopeHelp: scopeIsWorld
+        ? "Portable bindings use the world puzzle library. Copy this bound Tile to another Scene and it can open the same breach there."
+        : "Scene-local bindings remain locked to this Scene. Copying the Tile elsewhere will not open the breach.",
       helperCommand: `const hbl = game.modules.get("hexcode-breach-lite")?.api;\nif (!hbl) return ui.notifications.error("Hexcode Breach Lite API is not available. Confirm the module is enabled, then restart Foundry.");\nreturn hbl.openBound({\n  args: typeof args === "undefined" ? null : args,\n  tile: typeof tile === "undefined" ? null : tile,\n  token: typeof token === "undefined" ? null : token,\n  actor: typeof actor === "undefined" ? null : actor\n});`,
-      hasSavedPuzzle: Boolean(this.puzzleId && puzzles[this.puzzleId]),
+      hasSavedPuzzle: Boolean(this.puzzleId && (persistedScope === "world" ? worldPuzzles[this.puzzleId] : scenePuzzles[this.puzzleId])),
       hexPoolValue: this.puzzle.hexPool.join(" "),
       hexChoices: HBL.DEFAULT_HEX.map(value => ({ value, active: this.puzzle.hexPool.includes(value) })),
       sequenceRows: this.puzzle.sequences.map((sequence, index) => ({
@@ -968,12 +1407,31 @@ class HBLGMConfigApp extends Application {
     html.find("[data-action='new']").on("click", () => {
       this.puzzle = HBL.defaultPuzzle();
       this.puzzleId = null;
+      this.puzzleScope = "scene";
+      this.loadedScope = null;
       this.render();
     });
 
     html.find("[data-action='load']").on("change", event => {
-      this.puzzleId = event.currentTarget.value || null;
+      const value = String(event.currentTarget.value || "");
+      if (!value) {
+        this.puzzleId = null;
+        this.puzzleScope = "scene";
+        this.loadedScope = null;
+        this.puzzle = HBL.defaultPuzzle();
+        return this.render();
+      }
+      const [scope, id] = value.split("::", 2);
+      this.puzzleScope = HBL.normalizeStorageScope(scope);
+      this.loadedScope = this.puzzleScope;
+      this.puzzleId = id || null;
       this.puzzle = null;
+      this.render();
+    });
+
+    html.find("[name='storageScope']").on("change", () => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      if (!this.puzzleId) this.puzzleScope = this.puzzle.storageScope;
       this.render();
     });
 
@@ -1018,6 +1476,7 @@ class HBLGMConfigApp extends Application {
         id: this.puzzle?.id || hblRandomId(),
         name: currentName || HBL.TEMPLATES[key]?.label || "Hexcode Breach",
         publicProgress: form.querySelector("[name='publicProgress']")?.checked ?? true,
+        storageScope: this.puzzle?.storageScope || this.puzzleScope || "scene",
         createdAt: this.puzzle?.createdAt || Date.now()
       });
       this.render();
@@ -1057,18 +1516,20 @@ class HBLGMConfigApp extends Application {
 
     html.find("[data-action='save']").on("click", async () => {
       if (!this._updatePuzzleFromForm(html)) return;
-      const saved = await HBL.savePuzzle(this.puzzle);
-      this.puzzleId = saved?.id ?? this.puzzleId;
-      this.puzzle = saved ?? this.puzzle;
-      this.render();
+      const saved = await this.saveCurrentPuzzle();
+      if (saved) this.render();
     });
 
     html.find("[data-action='open-player']").on("click", async () => {
       if (!this._updatePuzzleFromForm(html)) return;
-      const saved = await HBL.savePuzzle(this.puzzle);
+      const saved = await this.saveCurrentPuzzle();
       if (saved?.id) {
+        const runtimePuzzle = await HBL.prepareRuntimePuzzle(saved);
         new HBLPlayerApp({
           puzzleId: saved.id,
+          puzzleScope: saved.storageScope,
+          sceneId: HBL.getScene()?.id ?? null,
+          runtimePuzzle,
           actor: HBL.getUserActor(),
           gmPreview: true
         }).render(true);
@@ -1077,10 +1538,8 @@ class HBLGMConfigApp extends Application {
 
     html.find("[data-action='bind-tile']").on("click", async () => {
       if (!this._updatePuzzleFromForm(html)) return;
-      const saved = await HBL.savePuzzle(this.puzzle);
+      const saved = await this.saveCurrentPuzzle();
       if (!saved?.id) return;
-      this.puzzleId = saved.id;
-      this.puzzle = saved;
       await HBL.bindSelectedTiles(saved);
       this.render();
     });
@@ -1091,6 +1550,7 @@ class HBLGMConfigApp extends Application {
     });
 
     html.find("[data-action='create-helper']").on("click", async () => HBL.createHelperMacro());
+    html.find("[data-action='reset-rewards']").on("click", async () => this.resetRewardClaims());
     html.find("[data-action='delete']").on("click", async () => this.deleteCurrentPuzzle());
 
     html.find(".hbl-document-drop").on("dragover", event => {
@@ -1178,18 +1638,62 @@ class HBLGMConfigApp extends Application {
     }
   }
 
+  async saveCurrentPuzzle() {
+    const targetScope = HBL.normalizeStorageScope(this.puzzle?.storageScope ?? this.puzzleScope ?? "scene");
+    if (this.puzzleId && this.loadedScope && this.loadedScope !== targetScope) {
+      const movingToWorld = targetScope === "world";
+      const ok = await Dialog.confirm({
+        title: movingToWorld ? "Move Breach to Portable World Library?" : "Move Breach to Current Scene?",
+        content: movingToWorld
+          ? `<p>Move <b>${hblEsc(this.puzzle.name)}</b> from this Scene into the <b>Portable World Library</b>? Existing Scene bindings will be upgraded to portable bindings and one-time reward claims will follow the puzzle.</p>`
+          : `<p>Move <b>${hblEsc(this.puzzle.name)}</b> from the <b>Portable World Library</b> into <b>${hblEsc(HBL.getScene()?.name || "the current Scene")}</b>? Portable bindings on other Scenes will be removed and one-time reward claims will follow the puzzle.</p>`
+      });
+      if (!ok) return null;
+    }
+
+    const saved = await HBL.savePuzzle(this.puzzle, {
+      scope: targetScope,
+      previousScope: this.loadedScope
+    });
+    if (!saved?.id) return null;
+    this.puzzleId = saved.id;
+    this.puzzleScope = saved.storageScope;
+    this.loadedScope = saved.storageScope;
+    this.puzzle = saved;
+    return saved;
+  }
+
   async deleteCurrentPuzzle() {
     if (!this.puzzleId) return ui.notifications.warn("Load a saved breach before deleting it.");
+    const scope = HBL.normalizeStorageScope(this.loadedScope ?? this.puzzleScope ?? this.puzzle?.storageScope);
+    const targetText = scope === "world"
+      ? "the Portable World Library and remove its portable Tile bindings from every Scene"
+      : `the Scene Library on <b>${hblEsc(HBL.getScene()?.name || "this scene")}</b>`;
     const ok = await Dialog.confirm({
-      title: "Delete Scene Breach?",
-      content: `<p>Delete <b>${hblEsc(this.puzzle.name)}</b> and remove its tile bindings from <b>${hblEsc(HBL.getScene()?.name || "this scene")}</b>?</p>`
+      title: scope === "world" ? "Delete Portable Breach?" : "Delete Scene Breach?",
+      content: `<p>Delete <b>${hblEsc(this.puzzle.name)}</b> from ${targetText}?</p>`
     });
     if (!ok) return;
-    const result = await HBL.deletePuzzle(this.puzzleId);
+    const result = await HBL.deletePuzzle(this.puzzleId, { scope });
     if (!result?.ok) return;
     this.puzzle = null;
     this.puzzleId = null;
+    this.puzzleScope = "scene";
+    this.loadedScope = null;
     await this.render(true);
+  }
+
+  async resetRewardClaims() {
+    if (!this.puzzleId) return ui.notifications.warn("Save the breach before resetting reward claims.");
+    const scope = HBL.normalizeStorageScope(this.loadedScope ?? this.puzzleScope ?? this.puzzle?.storageScope);
+    const ok = await Dialog.confirm({
+      title: "Reset One-Time Payload Claims?",
+      content: `<p>Re-arm all one-time rewards for <b>${hblEsc(this.puzzle?.name || "this breach")}</b>? Players will be able to extract those payloads again.</p>`
+    });
+    if (!ok) return;
+    const removed = await HBL.clearRewardClaimsForPuzzle(this.puzzleId, scope, HBL.getScene()?.id ?? null);
+    ui.notifications.info(removed ? `Reset ${removed} reward claim${removed === 1 ? "" : "s"}.` : "No one-time reward claims were stored for this breach.");
+    this.render();
   }
 
   _updatePuzzleFromForm(html) {
@@ -1207,6 +1711,8 @@ class HBLGMConfigApp extends Application {
     this.puzzle.bufferSize = Math.clamp(Number(fd.get("bufferSize")) || 6, 4, 14);
     this.puzzle.timerSeconds = Math.clamp(Number(fd.get("timerSeconds")) || 0, 0, 600);
     this.puzzle.publicProgress = fd.get("publicProgress") === "on";
+    this.puzzle.storageScope = HBL.normalizeStorageScope(fd.get("storageScope") || this.puzzle.storageScope || this.puzzleScope);
+    if (!this.puzzleId) this.puzzleScope = this.puzzle.storageScope;
     const previousPool = hblClone(this.puzzle.hexPool);
 
     const sequenceCount = Math.max(0, Number(fd.get("sequenceCount")) || this.puzzle.sequences.length);
@@ -1224,7 +1730,8 @@ class HBLGMConfigApp extends Application {
         rewardUuid: fd.get(`sequences.${i}.rewardUuid`),
         rewardName: fd.get(`sequences.${i}.rewardName`) || existing.rewardName,
         rollTableRef: fd.get(`sequences.${i}.rollTableRef`),
-        rollTableName: fd.get(`sequences.${i}.rollTableName`) || existing.rollTableName
+        rollTableName: fd.get(`sequences.${i}.rollTableName`) || existing.rollTableName,
+        repeatableReward: fd.get(`sequences.${i}.repeatableReward`) === "on"
       }));
     }
     this.puzzle.sequences = sequences.length
@@ -1250,8 +1757,12 @@ class HBLGMConfigApp extends Application {
 class HBLPlayerApp extends Application {
   constructor(options = {}) {
     super(options);
-    this.puzzleId = options.puzzleId ?? null;
-    this.puzzle = null;
+    this.puzzleId = options.puzzleId ?? options.runtimePuzzle?.id ?? null;
+    this.puzzleScope = options.puzzleScope
+      ? HBL.normalizeStorageScope(options.puzzleScope)
+      : HBL.normalizeStorageScope(options.runtimePuzzle?.storageScope);
+    this.sourceSceneId = options.sceneId ?? HBL.getScene()?.id ?? null;
+    this.puzzle = options.runtimePuzzle ? HBL.normalizePuzzle(hblClone(options.runtimePuzzle)) : null;
     this.buffer = [];
     this.clicked = [];
     this.startedAt = null;
@@ -1283,22 +1794,42 @@ class HBLPlayerApp extends Application {
 
   async getData() {
     if (this.enforceRole && !HBL.isNetrunner(this.actor)) {
-      const puzzle = this.puzzleId ? await HBL.getPuzzle(this.puzzleId) : null;
+      const puzzle = this.puzzle ?? (this.puzzleId
+        ? await HBL.getPuzzle(this.puzzleId, { scope: this.puzzleScope, sceneId: this.sourceSceneId })
+        : null);
       await HBL.postRoleDenied(this.actor, puzzle);
       setTimeout(() => this.close(), 0);
       return { blocked: true };
     }
 
-    const puzzles = await HBL.getScenePuzzles();
+    // Normal entry points prepare this snapshot before rendering. Keep a small
+    // compatibility fallback for direct/internal construction. The snapshot is
+    // created once and is never regenerated by getData()/rerenders.
     if (!this.puzzle) {
-      if (this.puzzleId && puzzles[this.puzzleId]) this.puzzle = HBL.normalizePuzzle(puzzles[this.puzzleId]);
-      else this.puzzle = HBL.normalizePuzzle(Object.values(puzzles)[0] ?? HBL.defaultPuzzle());
-      this.puzzle = await HBL.resolvePayloadNames(this.puzzle);
-      this.puzzle.sequences = this.puzzle.sequences.map(sequence => ({
-        ...sequence,
-        solved: false,
-        rewardGranted: this.claimedSequenceIds.has(sequence.id)
-      }));
+      let loaded = null;
+      if (this.puzzleId) {
+        loaded = await HBL.getPuzzle(this.puzzleId, { scope: this.puzzleScope, sceneId: this.sourceSceneId });
+      } else {
+        const scenePuzzles = await HBL.getScenePuzzles();
+        loaded = Object.values(scenePuzzles)[0] ?? null;
+        if (!loaded) {
+          const worldPuzzles = await HBL.getWorldPuzzles();
+          loaded = Object.values(worldPuzzles)[0] ?? null;
+        }
+      }
+
+      if (!loaded) {
+        ui.notifications.warn("Hexcode Breach puzzle could not be loaded.");
+        setTimeout(() => this.close(), 0);
+        return { blocked: true };
+      }
+
+      this.puzzle = await HBL.prepareRuntimePuzzle(loaded);
+      this.puzzleId = this.puzzle.id;
+      this.puzzleScope = this.puzzle.storageScope;
+    }
+
+    if (this.timeLimit === null) {
       this.timeLimit = Number(this.puzzle.timerSeconds) || 0;
       this.remaining = this.timeLimit;
     }
@@ -1334,6 +1865,9 @@ class HBLPlayerApp extends Application {
 
   activateListeners(html) {
     super.activateListeners(html);
+    // Deliberately restored to the proven v1.0.5 interaction shape: one normal
+    // Foundry click handler, one authoritative isAllowed() check, and normal
+    // Application renders. Portable/reward systems do not manage matrix DOM.
     html.find(".hbl-cell").on("click", event => this.onCellClick(event));
     html.find("[data-action='clear']").on("click", () => this.resetRun());
     html.find("[data-action='complete']").on("click", () => {
@@ -1345,19 +1879,21 @@ class HBLPlayerApp extends Application {
     html.find("[data-action='close']").on("click", () => this.close());
   }
 
-  async startTimer() {
+  startTimer() {
     if (this.startedAt || this.finished) return;
     this.timeLimit = Number(this.puzzle.timerSeconds) || 0;
     this.remaining = this.timeLimit;
     this.startedAt = Date.now();
     this.element.find(".hbl-timer-state").text("ACTIVE");
+    this.beginCountdown();
 
-    await HBL.postProgress(
+    // Chat is observability, not path state. Never make the next legal matrix
+    // click wait for a ChatMessage write.
+    void HBL.postProgress(
       this.puzzle,
       `<p><b>${hblEsc(game.user.name)}</b> started a breach${this.actor ? ` as <b>${hblEsc(this.actor.name)}</b>` : ""}.</p>`,
       { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
-    );
-    this.beginCountdown();
+    ).catch(err => console.warn(`${HBL_ID} | Could not post breach-start progress`, err));
   }
 
   beginCountdown() {
@@ -1388,17 +1924,26 @@ class HBLPlayerApp extends Application {
       return ui.notifications.warn("Invalid breach path. First pick must be top row, then alternate column/row.");
     }
 
-    if (!this.startedAt) await this.startTimer();
+    if (!this.startedAt) this.startTimer();
 
     const value = this.puzzle.matrix[r][c];
     this.clicked.push({ r, c, value });
     this.buffer.push(value);
-    await this.checkSequences();
+
+    // Sequence detection is synchronous. Update the normal Foundry UI first;
+    // reward sockets/chat settle only after the next legal route has already
+    // been handed back to Application#render.
+    const newlySolved = this.checkSequences();
+    const allSolved = this.puzzle.sequences.every(sequence => sequence.solved);
+    const bufferFilled = this.buffer.length >= this.puzzle.bufferSize;
+
+    if (!allSolved && !bufferFilled) this.render();
+    for (const sequence of newlySolved) void this.settleSequenceReward(sequence);
 
     if (this.finished) return;
-    if (this.puzzle.sequences.every(sequence => sequence.solved)) return this.success("All sequences cracked");
-    if (this.buffer.length >= this.puzzle.bufferSize) return this.finishRun("Buffer filled");
-    return this.render();
+    if (allSolved) return this.success("All sequences cracked");
+    if (bufferFilled) return this.finishRun("Buffer filled");
+    return this;
   }
 
   bufferContains(code) {
@@ -1413,19 +1958,39 @@ class HBLPlayerApp extends Application {
     return false;
   }
 
-  async checkSequences() {
+  checkSequences() {
+    const newlySolved = [];
     for (const sequence of this.puzzle.sequences) {
       if (!sequence.solved && this.bufferContains(sequence.code)) {
         sequence.solved = true;
-        const rewardHtml = await HBL.grantSequenceRewards(this.actor, sequence, this.puzzle);
-        if (sequence.rewardGranted) this.claimedSequenceIds.add(sequence.id);
-        await HBL.postProgress(
-          this.puzzle,
-          `<p>Sequence cracked: <b>${hblEsc(sequence.label)}</b> <code>${sequence.code.map(hblEsc).join(" ")}</code></p>${rewardHtml}`,
-          { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
-        );
+        newlySolved.push(sequence);
         ui.notifications.info(`Sequence cracked: ${sequence.label}`);
+        void HBL.postProgress(
+          this.puzzle,
+          `<p>Sequence cracked: <b>${hblEsc(sequence.label)}</b> <code>${sequence.code.map(hblEsc).join(" ")}</code></p>`,
+          { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
+        ).catch(err => console.warn(`${HBL_ID} | Could not post sequence progress`, err));
       }
+    }
+    return newlySolved;
+  }
+
+  async settleSequenceReward(sequence) {
+    try {
+      const rewardHtml = await HBL.grantSequenceRewards(this.actor, sequence, this.puzzle, {
+        gmPreview: this.gmPreview,
+        sceneId: this.sourceSceneId
+      });
+      if (sequence.rewardGranted) this.claimedSequenceIds.add(sequence.id);
+      if (!rewardHtml) return;
+      await HBL.postProgress(
+        this.puzzle,
+        `<p><b>Payload resolved — ${hblEsc(sequence.label)}</b></p>${rewardHtml}`,
+        { speaker: ChatMessage.getSpeaker({ actor: this.actor }) }
+      );
+    } catch (err) {
+      console.error(`${HBL_ID} | Reward settlement failed for ${sequence?.label || sequence?.id || "sequence"}`, err);
+      ui.notifications.warn(`Sequence cracked, but its payload could not be settled. Check F12 or retry after the GM is connected.`);
     }
   }
 
@@ -1548,6 +2113,8 @@ class HBLPlayerApp extends Application {
         reason: this.outcomeReason,
         puzzleId: this.puzzleId ?? this.puzzle?.id ?? null,
         puzzleName: this.puzzle?.name ?? null,
+        puzzleScope: this.puzzleScope ?? this.puzzle?.storageScope ?? "scene",
+        sceneId: this.sourceSceneId,
         actorId: this.actor?.id ?? null,
         actorUuid: this.actor?.uuid ?? null,
         solvedCount: solved.length,
@@ -1570,6 +2137,24 @@ function hblExposeApi() {
 }
 
 Hooks.once("init", () => {
+  game.settings.register(HBL_ID, HBL_SETTING_WORLD_PUZZLES, {
+    name: "Portable Hexcode Breach Puzzle Library",
+    hint: "Hidden world-level storage used by portable Hexcode Breach puzzles.",
+    scope: "world",
+    config: false,
+    type: Object,
+    default: {}
+  });
+
+  game.settings.register(HBL_ID, HBL_SETTING_REWARD_CLAIMS, {
+    name: "Hexcode Breach One-Time Reward Claims",
+    hint: "Hidden GM-authoritative ledger preventing one-time breach rewards from being farmed repeatedly.",
+    scope: "world",
+    config: false,
+    type: Object,
+    default: {}
+  });
+
   game.settings.register(HBL_ID, "enableDebug", {
     name: "Enable Debug Logging",
     hint: "Log Hexcode Breach Lite debug information to the console.",
@@ -1585,6 +2170,30 @@ Hooks.once("init", () => {
 
 Hooks.once("ready", () => {
   hblExposeApi();
+
+  game.socket.on(HBL_SOCKET, async message => {
+    if (!message || typeof message !== "object") return;
+
+    if (message.type === "reward-response" && message.targetUserId === game.user.id) {
+      const pending = HBL.pendingRewardRequests.get(message.requestId);
+      if (!pending) return;
+      window.clearTimeout(pending.timeout);
+      HBL.pendingRewardRequests.delete(message.requestId);
+      pending.resolve(message.result || { ok: false, html: "" });
+      return;
+    }
+
+    if (message.type === "reward-request" && game.user.isGM && message.targetGMId === game.user.id) {
+      const result = await HBL.processSequenceRewardRequest(message.payload || {});
+      game.socket.emit(HBL_SOCKET, {
+        type: "reward-response",
+        requestId: message.requestId,
+        targetUserId: message.senderId,
+        result
+      });
+    }
+  });
+
   console.log(`${HBL_ID} | Ready. API: HexcodeBreachLite.openGM(), HexcodeBreachLite.openPuzzle(id), game.hexcodebreach(context)`);
 });
 
