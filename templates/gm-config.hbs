@@ -2,26 +2,46 @@
   <header class="hbl-header">
     <div>
       <h2>HEXCODE BREACH LITE</h2>
-      <p>Build a scene breach, customize each daemon, then open it for the Netrunner.</p>
-      <p class="hbl-scene-line"><i class="fas fa-map"></i> Scene-local storage: <b>{{sceneName}}</b>. The live binding count is shown in the Tile Binding panel below.</p>
+      <p>Build scene-local breaches or portable devices that can travel between Scenes.</p>
+      <p class="hbl-scene-line"><i class="fas fa-map"></i> Active Scene: <b>{{sceneName}}</b>. Scene and Portable World libraries are both available below.</p>
     </div>
     <button type="button" data-action="new"><i class="fas fa-file"></i> New Puzzle</button>
   </header>
 
   <section class="hbl-grid-2 hbl-top-config">
     <div class="hbl-panel">
-      <label>Scene Breach Library</label>
+      <label>Breach Library</label>
       <select data-action="load">
         <option value="">— New / Unsaved —</option>
-        {{#each puzzles}}
-          <option value="{{this.id}}" {{#if (eq this.id ../puzzle.id)}}selected{{/if}}>{{this.name}}</option>
-        {{/each}}
+        {{#if scenePuzzles.length}}
+          <optgroup label="Scene — {{sceneName}}">
+            {{#each scenePuzzles}}
+              <option value="{{this.selectionKey}}" {{#if this.selected}}selected{{/if}}>[SCENE] {{this.name}}</option>
+            {{/each}}
+          </optgroup>
+        {{/if}}
+        {{#if worldPuzzles.length}}
+          <optgroup label="Portable World Library">
+            {{#each worldPuzzles}}
+              <option value="{{this.selectionKey}}" {{#if this.selected}}selected{{/if}}>[PORTABLE] {{this.name}}</option>
+            {{/each}}
+          </optgroup>
+        {{/if}}
       </select>
+
+      <label>Storage Scope</label>
+      <select name="storageScope">
+        <option value="scene" {{#unless scopeIsWorld}}selected{{/unless}}>Scene-local — stays on {{sceneName}}</option>
+        <option value="world" {{#if scopeIsWorld}}selected{{/if}}>Portable (World) — usable from any Scene</option>
+      </select>
+      <p class="hbl-help">Use <b>Scene-local</b> for fixed terminals, doors, cameras, and networks. Use <b>Portable</b> for stolen laptops, carried devices, or any breach that should survive a Scene change.</p>
+
       <div class="hbl-library-actions">
         <button type="button" data-action="save"><i class="fas fa-save"></i> Save Puzzle</button>
         <button type="button" class="hbl-danger" data-action="delete" {{#unless hasSavedPuzzle}}disabled{{/unless}}><i class="fas fa-trash"></i> Delete Loaded Puzzle</button>
       </div>
-      <p class="hbl-help">Each saved breach exists only on <b>{{sceneName}}</b>.</p>
+      <p class="hbl-help">Changing the Storage Scope on a saved puzzle moves it between libraries when you press Save. Existing bindings and one-time reward claims are migrated where possible.</p>
+      {{#if scopeChangePending}}<p class="hbl-scope-warning"><i class="fas fa-exchange-alt"></i> Scope change pending: <b>{{persistedScopeLabel}}</b> → <b>{{storageScopeLabel}}</b>. Press Save to confirm the move.</p>{{/if}}
     </div>
 
     <div class="hbl-panel hbl-template-panel">
@@ -78,7 +98,7 @@
     <div class="hbl-section-heading">
       <div>
         <label>Hexcode Sequences & Rewards</label>
-        <p class="hbl-help">One cracked sequence is a successful breach. Delete any unwanted sequence with its red trash button.</p>
+        <p class="hbl-help">Cracking at least one sequence secures a partial success; cracking every sequence is a full success. Delete any unwanted sequence with its red trash button.</p>
       </div>
       <button type="button" data-action="add-sequence"><i class="fas fa-plus"></i> Add Sequence</button>
     </div>
@@ -172,15 +192,26 @@
               </div>
             </div>
           </div>
+          <label class="hbl-check hbl-repeatable-reward"><input name="sequences.{{seq.index}}.repeatableReward" type="checkbox" {{#if seq.repeatableReward}}checked{{/if}} /> Repeatable payload <span class="hbl-muted">(off by default; leave unchecked for loot/data that should only be extractable once)</span></label>
         </article>
       {{/each}}
     </div>
   </section>
 
+  <section class="hbl-panel hbl-reward-claims-panel">
+    <div>
+      <label>One-Time Payload Claims</label>
+      <p class="hbl-help"><b>{{rewardClaimedCount}}</b> of <b>{{rewardClaimTotal}}</b> one-time reward sequence(s) have been extracted. These claims follow a puzzle when its Storage Scope is moved.</p>
+      <p class="hbl-help">GM Preview never grants or consumes rewards. Use <b>Reset Reward Claims</b> only when intentionally re-arming a device for another run.</p>
+    </div>
+    <button type="button" data-action="reset-rewards" {{#unless hasSavedPuzzle}}disabled{{/unless}}><i class="fas fa-undo"></i> Reset Reward Claims</button>
+  </section>
+
   <section class="hbl-panel hbl-binding-panel">
     <div class="hbl-binding-copy">
-      <label>Scene Tile Binding</label>
-      <p class="hbl-help"><b>{{boundTileCount}}</b> tile(s) on <b>{{sceneName}}</b> are bound to this breach. Select Tiles with Foundry's Tile Controls before binding.</p>
+      <label>Tile Binding — {{storageScopeLabel}}</label>
+      <p class="hbl-help"><b>{{boundTileCount}}</b> tile(s) on <b>{{sceneName}}</b> are bound to this breach.{{#if scopeIsWorld}} <b>{{boundTileTotal}}</b> portable binding(s) exist across all Scenes.{{/if}}</p>
+      <p class="hbl-help">{{bindingScopeHelp}}</p>
       <p class="hbl-help">Only an Actor with the <b>Netrunner</b> Role or <b>Interface</b> Role Ability can open a bound breach.</p>
       <code>{{helperCommand}}</code>
     </div>
@@ -193,7 +224,7 @@
 
   <footer class="hbl-footer">
     <button type="button" data-action="rebuild"><i class="fas fa-random"></i> Rebuild Grid</button>
-    <button type="button" data-action="save"><i class="fas fa-save"></i> Save to Scene</button>
+    <button type="button" data-action="save"><i class="fas fa-save"></i> {{saveButtonLabel}}</button>
     <button type="button" data-action="open-player"><i class="fas fa-desktop"></i> Save + GM Preview</button>
     <button type="button" class="hbl-danger" data-action="delete" {{#unless hasSavedPuzzle}}disabled{{/unless}}><i class="fas fa-trash"></i> Delete Puzzle</button>
   </footer>
