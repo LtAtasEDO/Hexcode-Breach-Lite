@@ -40,6 +40,7 @@ const HBL = {
   DEFAULT_HEX: ["1C", "55", "BD", "E9", "7A", "FF"],
   roleDenialCache: new Map(),
   pendingRewardRequests: new Map(),
+  rewardRequestQueue: Promise.resolve(),
 
   normalizeStorageScope(value) {
     return String(value || "scene").toLowerCase() === "world" ? "world" : "scene";
@@ -82,7 +83,7 @@ const HBL = {
     // matrix interaction loop, matching the proven v1.0.5 architecture.
     let runtime = this.normalizePuzzle(hblClone(puzzle));
     runtime = await this.resolvePayloadNames(runtime);
-    if (randomizeMatrix) runtime.matrix = this.generateMatrix(runtime.gridSize, runtime.hexPool);
+    if (randomizeMatrix) runtime.matrix = this.generateSolvableMatrix(runtime);
     runtime.sequences = runtime.sequences.map(sequence => ({
       ...sequence,
       solved: false,
@@ -264,6 +265,294 @@ const HBL = {
     return Array.from({ length: size }, () =>
       Array.from({ length: size }, () => cleanPool[Math.floor(Math.random() * cleanPool.length)])
     );
+  },
+
+  codeContains(haystack, needle) {
+    if (!needle?.length) return true;
+    if (!haystack?.length || needle.length > haystack.length) return false;
+    outer: for (let i = 0; i <= haystack.length - needle.length; i++) {
+      for (let j = 0; j < needle.length; j++) {
+        if (haystack[i + j] !== needle[j]) continue outer;
+      }
+      return true;
+    }
+    return false;
+  },
+
+  maxSuffixPrefixOverlap(a, b) {
+    if (!a?.length || !b?.length) return 0;
+    const max = Math.min(a.length, b.length);
+    for (let n = max; n >= 1; n--) {
+      let matched = true;
+      for (let k = 0; k < n; k++) {
+        if (a[a.length - n + k] !== b[k]) { matched = false; break; }
+      }
+      if (matched) return n;
+    }
+    return 0;
+  },
+
+  buildGreedyCoverCode(codes) {
+    // Fast overlap heuristic used only as a safety fallback when a custom
+    // puzzle contains too many independent sequences for the exact planner.
+    let items = (codes ?? [])
+      .map(code => (Array.isArray(code) ? code : []).slice())
+      .filter(code => code.length);
+    if (!items.length) return [];
+
+    // Remove exact duplicates and codes already contained by another code.
+    items = items.filter((code, index, all) => {
+      const first = all.findIndex(other => other.length === code.length && other.every((value, i) => value === code[i]));
+      if (first !== index) return false;
+      return !all.some((other, otherIndex) => otherIndex !== index && other.length >= code.length && this.codeContains(other, code));
+    });
+
+    while (items.length > 1) {
+      let best = { overlap: -1, i: 0, j: 1 };
+      for (let i = 0; i < items.length; i++) {
+        for (let j = 0; j < items.length; j++) {
+          if (i === j) continue;
+          const overlap = this.maxSuffixPrefixOverlap(items[i], items[j]);
+          if (overlap > best.overlap) best = { overlap, i, j };
+        }
+      }
+      const merged = items[best.i].concat(items[best.j].slice(Math.max(0, best.overlap)));
+      items = items.filter((_, k) => k !== best.i && k !== best.j);
+      items.push(merged);
+    }
+    return items[0] ?? [];
+  },
+
+  buildCoverPlan(codes, limit = Infinity) {
+    // Build the shortest exact overlap cover for normal-sized puzzles, then
+    // select the best cover that actually fits the configured buffer. This
+    // keeps the CP2077-style buffer as a real capacity while still allowing
+    // overlapping sequences to resolve on the same traced path.
+    const originals = (codes ?? [])
+      .map(code => (Array.isArray(code) ? code : []).slice())
+      .filter(code => code.length);
+    if (!originals.length) {
+      return { code: [], full: true, coveredCount: 0, totalCount: 0, fullCoverLength: 0, exact: true };
+    }
+
+    const maxLength = Number.isFinite(limit) ? Math.max(0, Math.trunc(limit)) : Infinity;
+    const unique = [];
+    for (const code of originals) {
+      if (!unique.some(other => other.length === code.length && other.every((value, i) => value === code[i]))) {
+        unique.push(code);
+      }
+    }
+
+    // A sequence wholly contained inside another independent sequence does
+    // not need its own DP node: cracking the longer sequence cracks it too.
+    const items = unique.filter((code, index, all) =>
+      !all.some((other, otherIndex) => otherIndex !== index && other.length >= code.length && this.codeContains(other, code))
+    );
+
+    const scoreCover = code => {
+      const covered = originals.filter(sequence => this.codeContains(code, sequence));
+      return {
+        coveredCount: covered.length,
+        coveredHexes: covered.reduce((sum, sequence) => sum + sequence.length, 0)
+      };
+    };
+
+    // Protect the browser from pathological custom editors with dozens of
+    // independent sequences. Normal templates use only a handful, so the
+    // exact planner handles all standard gameplay cases.
+    if (items.length > 12) {
+      console.warn(`${HBL_ID} | ${items.length} independent sequences exceed the exact cover planner limit; using the greedy fallback.`);
+      const fullCode = this.buildGreedyCoverCode(items);
+      let bestCode = fullCode.length <= maxLength ? fullCode : [];
+      let bestScore = scoreCover(bestCode);
+
+      // If the complete greedy cover does not fit, at least embed the best
+      // individual/contained partial route that does fit the real buffer.
+      for (const candidate of unique) {
+        if (candidate.length > maxLength) continue;
+        const score = scoreCover(candidate);
+        if (
+          score.coveredCount > bestScore.coveredCount
+          || (score.coveredCount === bestScore.coveredCount && score.coveredHexes > bestScore.coveredHexes)
+          || (score.coveredCount === bestScore.coveredCount && score.coveredHexes === bestScore.coveredHexes && (!bestCode.length || candidate.length < bestCode.length))
+        ) {
+          bestCode = candidate.slice();
+          bestScore = score;
+        }
+      }
+
+      return {
+        code: bestCode,
+        full: bestScore.coveredCount === originals.length,
+        coveredCount: bestScore.coveredCount,
+        totalCount: originals.length,
+        fullCoverLength: fullCode.length || null,
+        exact: false
+      };
+    }
+
+    const count = items.length;
+    const totalMasks = 1 << count;
+    const dp = Array.from({ length: totalMasks }, () => Array(count).fill(null));
+    for (let i = 0; i < count; i++) dp[1 << i][i] = items[i].slice();
+
+    const isBetter = (candidate, current) => {
+      if (!current) return true;
+      if (candidate.length !== current.length) return candidate.length < current.length;
+      return candidate.join('|') < current.join('|');
+    };
+
+    for (let mask = 1; mask < totalMasks; mask++) {
+      for (let last = 0; last < count; last++) {
+        const current = dp[mask][last];
+        if (!current) continue;
+        for (let next = 0; next < count; next++) {
+          if (mask & (1 << next)) continue;
+          const overlap = this.maxSuffixPrefixOverlap(items[last], items[next]);
+          const candidate = current.concat(items[next].slice(overlap));
+          const nextMask = mask | (1 << next);
+          if (isBetter(candidate, dp[nextMask][next])) dp[nextMask][next] = candidate;
+        }
+      }
+    }
+
+    const fullMask = totalMasks - 1;
+    let fullCode = null;
+    for (let last = 0; last < count; last++) {
+      const candidate = dp[fullMask][last];
+      if (candidate && isBetter(candidate, fullCode)) fullCode = candidate;
+    }
+
+    let bestCode = [];
+    let bestScore = scoreCover(bestCode);
+    for (let mask = 1; mask < totalMasks; mask++) {
+      for (let last = 0; last < count; last++) {
+        const candidate = dp[mask][last];
+        if (!candidate || candidate.length > maxLength) continue;
+        const score = scoreCover(candidate);
+        if (
+          score.coveredCount > bestScore.coveredCount
+          || (score.coveredCount === bestScore.coveredCount && score.coveredHexes > bestScore.coveredHexes)
+          || (score.coveredCount === bestScore.coveredCount && score.coveredHexes === bestScore.coveredHexes && (!bestCode.length || candidate.length < bestCode.length))
+        ) {
+          bestCode = candidate.slice();
+          bestScore = score;
+        }
+      }
+    }
+
+    return {
+      code: bestCode,
+      full: bestScore.coveredCount === originals.length,
+      coveredCount: bestScore.coveredCount,
+      totalCount: originals.length,
+      fullCoverLength: fullCode?.length ?? null,
+      exact: true
+    };
+  },
+
+  buildCoverCode(codes) {
+    // Backward-compatible helper: return the complete overlap cover when one
+    // is requested without a gameplay buffer limit.
+    return this.buildCoverPlan(codes, Infinity).code;
+  },
+
+  findSnakePath(size, length) {
+    // Find one legal player route: top-row start, then alternating vertical /
+    // horizontal moves with no revisits. The real gameplay buffer tops out at
+    // 14, so an exhaustive DFS is cheap on every supported 4x4-8x8 matrix.
+    if (!Number.isInteger(size) || size < 2) return null;
+    if (!Number.isInteger(length) || length < 1 || length > size * size) return null;
+
+    let found = null;
+    for (let startColumn = 0; startColumn < size && !found; startColumn++) {
+      const path = [[0, startColumn]];
+      const seen = new Set([`0,${startColumn}`]);
+
+      const walk = vertical => {
+        if (path.length === length) return path.map(cell => cell.slice());
+        const [r, c] = path[path.length - 1];
+        const options = [];
+        if (vertical) {
+          for (let rr = 0; rr < size; rr++) {
+            if (rr !== r && !seen.has(`${rr},${c}`)) options.push([rr, c]);
+          }
+        } else {
+          for (let cc = 0; cc < size; cc++) {
+            if (cc !== c && !seen.has(`${r},${cc}`)) options.push([r, cc]);
+          }
+        }
+
+        // Warnsdorff-style ordering finds long routes immediately without the
+        // old random 64-attempt failure mode.
+        options.sort((a, b) => {
+          const degree = ([rr, cc]) => {
+            let total = 0;
+            if (vertical) {
+              for (let c2 = 0; c2 < size; c2++) if (c2 !== cc && !seen.has(`${rr},${c2}`)) total++;
+            } else {
+              for (let r2 = 0; r2 < size; r2++) if (r2 !== rr && !seen.has(`${r2},${cc}`)) total++;
+            }
+            return total;
+          };
+          return degree(a) - degree(b);
+        });
+
+        for (const next of options) {
+          const key = `${next[0]},${next[1]}`;
+          seen.add(key);
+          path.push(next);
+          const result = walk(!vertical);
+          if (result) return result;
+          path.pop();
+          seen.delete(key);
+        }
+        return null;
+      };
+
+      found = walk(true);
+    }
+    if (!found) return null;
+
+    // Random row/column bijections preserve every legal relation while making
+    // the embedded route land in different cells on each fresh attempt. Row 0
+    // stays row 0 so the first click remains a valid top-row selection.
+    const shuffle = values => {
+      const result = values.slice();
+      for (let i = result.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [result[i], result[j]] = [result[j], result[i]];
+      }
+      return result;
+    };
+    const rowMap = [0, ...shuffle(Array.from({ length: size - 1 }, (_, i) => i + 1))];
+    const colMap = shuffle(Array.from({ length: size }, (_, i) => i));
+    return found.map(([r, c]) => [rowMap[r], colMap[c]]);
+  },
+
+  generateSolvableMatrix(puzzle) {
+    // Generate a fresh matrix and embed the strongest legal route that fits
+    // the ACTUAL configured buffer. If every sequence can overlap within that
+    // capacity the matrix guarantees a full-success route; otherwise it
+    // guarantees the best planned partial route instead of removing the cap.
+    const size = Math.clamp(Number(puzzle?.gridSize) || 5, 3, 8);
+    const pool = this.normalizeHexPool(puzzle?.hexPool);
+    const matrix = this.generateMatrix(size, pool);
+    const bufferSize = Math.clamp(Number(puzzle?.bufferSize) || 6, 4, 14);
+    const plan = this.buildCoverPlan((puzzle?.sequences ?? []).map(sequence => sequence.code), bufferSize);
+    const cover = plan.code;
+    if (!cover.length) return matrix;
+    if (cover.length > size * size) {
+      console.warn(`${HBL_ID} | Planned ${cover.length}-hex route cannot fit a ${size}x${size} matrix; using a plain random matrix.`);
+      return matrix;
+    }
+    const path = this.findSnakePath(size, cover.length);
+    if (!path) {
+      console.warn(`${HBL_ID} | No legal ${cover.length}-step route exists on the ${size}x${size} matrix; using a plain random matrix.`);
+      return matrix;
+    }
+    path.forEach(([r, c], index) => { matrix[r][c] = cover[index]; });
+    return matrix;
   },
 
   getScene() {
@@ -772,6 +1061,17 @@ return hbl.openBound({
     return moved;
   },
 
+  enqueueRewardRequest(work) {
+    // One active GM is authoritative for claims. Serialize the COMPLETE
+    // verify -> pending -> grant -> claimed transaction so two sequences that
+    // crack on the same click cannot overwrite each other's claim ledger.
+    const run = this.rewardRequestQueue.then(() => work());
+    this.rewardRequestQueue = run.catch(err => {
+      console.error(`${HBL_ID} | Reward request queue recovered from an error`, err);
+    });
+    return run;
+  },
+
   async requestSequenceReward({ puzzleId, puzzleScope, sceneId, sequenceId, actorUuid, actorId }) {
     const payload = {
       puzzleId,
@@ -781,7 +1081,7 @@ return hbl.openBound({
       actorUuid,
       actorId
     };
-    if (game.user.isGM) return this.processSequenceRewardRequest(payload);
+    if (game.user.isGM) return this.enqueueRewardRequest(() => this.processSequenceRewardRequest(payload));
 
     const gm = this.getPrimaryActiveGM();
     if (!gm) {
@@ -1848,7 +2148,9 @@ class HBLPlayerApp extends Application {
       blocked: false,
       puzzle: this.puzzle,
       matrixRows,
-      buffer: Array.from({ length: this.puzzle.bufferSize }, (_, index) => this.buffer[index] ?? ""),
+      buffer: Array.from({ length: this.puzzle.bufferSize }, (_, index) =>
+        this.buffer[index] ?? ""
+      ),
       remaining: this.remaining,
       timerDisplay: this.puzzle.timerSeconds ? this.remaining : "∞",
       timerStarted: Boolean(this.startedAt),
@@ -1930,9 +2232,9 @@ class HBLPlayerApp extends Application {
     this.clicked.push({ r, c, value });
     this.buffer.push(value);
 
-    // Sequence detection is synchronous. Update the normal Foundry UI first;
-    // reward sockets/chat settle only after the next legal route has already
-    // been handed back to Application#render.
+    // Sequence detection is synchronous over the real fixed-capacity buffer.
+    // Substring matching naturally supports overlap: 1C 55 1C cracks both
+    // 1C 55 and 55 1C without granting extra buffer slots.
     const newlySolved = this.checkSequences();
     const allSolved = this.puzzle.sequences.every(sequence => sequence.solved);
     const bufferFilled = this.buffer.length >= this.puzzle.bufferSize;
@@ -2051,7 +2353,7 @@ class HBLPlayerApp extends Application {
     this.stopTimer();
     this.buffer = [];
     this.clicked = [];
-    this.puzzle.matrix = HBL.generateMatrix(this.puzzle.gridSize, this.puzzle.hexPool);
+    this.puzzle.matrix = HBL.generateSolvableMatrix(this.puzzle);
     this.puzzle.sequences = this.puzzle.sequences.map(sequence => ({
       ...sequence,
       rewardGranted: this.claimedSequenceIds.has(sequence.id)
@@ -2184,7 +2486,7 @@ Hooks.once("ready", () => {
     }
 
     if (message.type === "reward-request" && game.user.isGM && message.targetGMId === game.user.id) {
-      const result = await HBL.processSequenceRewardRequest(message.payload || {});
+      const result = await HBL.enqueueRewardRequest(() => HBL.processSequenceRewardRequest(message.payload || {}));
       game.socket.emit(HBL_SOCKET, {
         type: "reward-response",
         requestId: message.requestId,
