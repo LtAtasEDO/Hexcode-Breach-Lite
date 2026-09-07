@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.0 — 2026-09-06
+
+Overlapping-sequence and solvability hardening after live testing and audit.
+
+- **Overlapping sequences resolve in one legal buffer, like Cyberpunk 2077.** A walk such as `1C-55-1C` cracks both `1C-55` and `55-1C` in the same breach. Sequence matching remains synchronous and supports shared hexes naturally.
+- Restored the **Buffer filled** hard stop from v1.1.0 (deprecated hotfix designated v1.1.1). The configured 4–14 slots are again a real gameplay capacity rather than a sliding display window.
+- Reworked live-attempt matrix generation to be **buffer-aware**. For normal puzzle sizes, Hexcode computes an exact shortest overlap cover and embeds a legal route only within the configured buffer. If all sequences cannot fit together, the best planned partial route is embedded instead of granting extra inputs.
+- Replaced the randomized 64-retry snake finder with deterministic legal-route backtracking, then randomizes its row/column placement. This removes the rare valid-route-but-generator-gave-up failure mode while keeping attempt layouts fresh.
+- Serialized GM-authoritative reward request processing. Multiple sequences that crack on the same click can no longer race the one-time reward claim ledger through concurrent read/modify/write cycles.
+- GM preview and GM editor sample matrices remain plain-random previews by design.
+- Preserved the v1.1.0 outcome and integration contracts: `success` / `partial` / `failure` / `aborted`, `closeHBLPlayerApp`, Portable (World) puzzles, one-time claims, Repeatable payloads, Reset Reward Claims, package sockets, and player-account reward delivery.
+- Updated Cyberpunk RED compatibility metadata to remain minimum `0.92.1` and verified through `0.92.4`.
+- No puzzle, binding, storage, or reward-claim migration is required from v1.1.0.
+
 ## 1.1.0 — 2026-09-05
 
 Stable release promoted after live Gamemaster and player-account validation.
