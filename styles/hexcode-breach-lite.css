@@ -911,3 +911,61 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* v1.2.1 — dependency-free GM push workflow. */
+.hbl-push-icon {
+  color: #42f3ff;
+  font-size: 30px;
+  text-shadow: 0 0 12px rgba(0, 229, 255, 0.72);
+}
+
+.hbl-push-target-label {
+  margin-top: 12px;
+}
+
+.hbl-push-readout,
+.hbl-push-empty {
+  min-height: 34px;
+  padding: 8px 10px;
+  border: 1px solid rgba(0, 229, 255, 0.58);
+  background: rgba(0, 229, 255, 0.08);
+  color: #fff36a;
+  overflow-wrap: anywhere;
+}
+
+.hbl-push-readout b {
+  color: #42f3ff;
+}
+
+.hbl-push-empty {
+  border-color: rgba(255, 83, 104, 0.58);
+  color: #ff9aa7;
+}
+
+.hbl-push-note {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  border-color: rgba(0, 229, 255, 0.58);
+}
+
+.hbl-push-note > i {
+  color: #42f3ff;
+  font-size: 20px;
+  margin-top: 2px;
+}
+
+.hbl-push-note b {
+  color: #42f3ff;
+}
+
+.hbl-push-note p {
+  margin: 4px 0 0;
+  color: #d6ca72;
+  font-size: 11px;
+}
+
+.hbl-push-footer {
+  grid-template-columns: repeat(2, auto);
+}
