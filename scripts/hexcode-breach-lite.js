@@ -5,6 +5,7 @@ const HBL_SETTING_WORLD_PUZZLES = "worldPuzzles";
 const HBL_SETTING_REWARD_CLAIMS = "rewardClaims";
 const HBL_SOCKET = `module.${HBL_ID}`;
 const HBL_REWARD_REQUEST_TIMEOUT = 10000;
+const HBL_PUSH_REQUEST_TIMEOUT = 8000;
 const HBL_ROLE_DENIAL_COOLDOWN = 4000;
 
 function hblClone(obj) {
@@ -40,6 +41,7 @@ const HBL = {
   DEFAULT_HEX: ["1C", "55", "BD", "E9", "7A", "FF"],
   roleDenialCache: new Map(),
   pendingRewardRequests: new Map(),
+  pendingPushRequests: new Map(),
   rewardRequestQueue: Promise.resolve(),
 
   normalizeStorageScope(value) {
@@ -802,7 +804,8 @@ const HBL = {
 
   async openPuzzle(puzzleId = null, options = {}) {
     const requestedScope = options.scope ? this.normalizeStorageScope(options.scope) : null;
-    let puzzle = puzzleId ? await this.getPuzzle(puzzleId, { scope: requestedScope }) : null;
+    const sourceSceneId = options.sceneId ?? null;
+    let puzzle = puzzleId ? await this.getPuzzle(puzzleId, { scope: requestedScope, sceneId: sourceSceneId }) : null;
 
     if (!puzzleId) {
       const scenePuzzles = await this.getScenePuzzles();
@@ -988,6 +991,183 @@ return hbl.openBound({
     return Array.from(game.users ?? [])
       .filter(user => user?.active && user?.isGM)
       .sort((a, b) => String(a.id).localeCompare(String(b.id)))[0] ?? null;
+  },
+
+  userOwnsActor(user, actor) {
+    if (!user || !actor) return false;
+    const ownerLevel = CONST?.DOCUMENT_OWNERSHIP_LEVELS?.OWNER ?? 3;
+    try {
+      if (typeof actor.testUserPermission === "function") return actor.testUserPermission(user, ownerLevel);
+      if (typeof actor.getUserLevel === "function") return actor.getUserLevel(user) >= ownerLevel;
+    } catch (_err) {
+      // Fall through to stored ownership data.
+    }
+    const ownership = actor.ownership ?? {};
+    const level = Number(ownership[user.id] ?? ownership.default ?? 0);
+    return level >= ownerLevel;
+  },
+
+  getPushTargets(sceneRef = null) {
+    const scene = this.resolveScene(sceneRef);
+    const users = Array.from(game.users ?? [])
+      .filter(user => user?.active && !user?.isGM)
+      .sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+    const targets = [];
+
+    for (const user of users) {
+      const owned = new Map();
+      const addActor = (actor, source = "Owned Actor") => {
+        if (!actor || !this.isNetrunner(actor) || !this.userOwnsActor(user, actor)) return;
+        const actorUuid = String(actor.uuid || "");
+        const actorId = String(actor.id || "");
+        const key = actorUuid || actorId;
+        if (!key || owned.has(key)) return;
+        owned.set(key, {
+          userId: user.id,
+          userName: user.name || "Player",
+          actorUuid,
+          actorId,
+          actorName: actor.name || "Netrunner",
+          source
+        });
+      };
+
+      // Current-scene owned tokens are the strongest signal for who is actually
+      // at the table right now. They are listed first and deduplicated by Actor.
+      for (const token of Array.from(scene?.tokens ?? [])) {
+        addActor(token?.actor, `Token: ${token?.name || token?.actor?.name || "Netrunner"}`);
+      }
+
+      // Keep a player's explicitly assigned character available even when that
+      // Actor does not currently have a token on the viewed Scene.
+      addActor(user.character, "Assigned Character");
+
+      // Avoid a giant selector: only scan the world Actor directory when this
+      // online player has no current-scene/assigned Netrunner candidate.
+      if (!owned.size) {
+        for (const actor of Array.from(game.actors ?? [])) addActor(actor, "Owned Actor");
+      }
+
+      targets.push(...owned.values());
+    }
+
+    return targets.map((target, index) => ({
+      ...target,
+      key: String(index),
+      label: `${target.userName} — ${target.actorName} (${target.source})`
+    }));
+  },
+
+  async pushPuzzleToUser({ puzzleId, puzzleScope = "scene", sceneId = null, targetUserId, actorUuid = "", actorId = "" } = {}) {
+    if (!game.user.isGM) {
+      return { ok: false, message: "Only a GM can push a Hexcode Breach to another player." };
+    }
+    const scope = this.normalizeStorageScope(puzzleScope);
+    const sourceSceneId = scope === "scene" ? (sceneId || this.getScene()?.id || null) : null;
+    const puzzle = await this.getPuzzle(puzzleId, { scope, sceneId: sourceSceneId });
+    if (!puzzle) return { ok: false, message: "That saved Hexcode Breach could not be found." };
+
+    const targetUser = game.users?.get?.(targetUserId) ?? null;
+    if (!targetUser?.active || targetUser.isGM) {
+      return { ok: false, message: "That player is no longer online." };
+    }
+
+    const candidates = this.getPushTargets(sourceSceneId || this.getScene());
+    const target = candidates.find(entry => entry.userId === targetUser.id && (
+      (actorUuid && entry.actorUuid === actorUuid)
+      || (!actorUuid && actorId && entry.actorId === actorId)
+    ));
+    if (!target) {
+      return { ok: false, message: `${targetUser.name || "That player"} no longer has an eligible owned Netrunner for this push.` };
+    }
+
+    const requestId = hblRandomId();
+    return new Promise(resolve => {
+      const timeout = window.setTimeout(() => {
+        this.pendingPushRequests.delete(requestId);
+        resolve({ ok: false, message: `${targetUser.name || "Player"} did not acknowledge the pushed breach.` });
+      }, HBL_PUSH_REQUEST_TIMEOUT);
+      this.pendingPushRequests.set(requestId, { resolve, timeout });
+      game.socket.emit(HBL_SOCKET, {
+        type: "push-puzzle-request",
+        requestId,
+        senderId: game.user.id,
+        targetUserId: targetUser.id,
+        payload: {
+          puzzleId: puzzle.id,
+          puzzleScope: scope,
+          sceneId: sourceSceneId,
+          actorUuid: target.actorUuid,
+          actorId: target.actorId
+        }
+      });
+    });
+  },
+
+  async processPushPuzzleRequest(message = {}) {
+    if (message.targetUserId !== game.user.id) return null;
+    const sender = game.users?.get?.(message.senderId) ?? null;
+    if (!sender?.isGM) return null;
+
+    const payload = message.payload || {};
+    const scope = this.normalizeStorageScope(payload.puzzleScope);
+    const sceneId = scope === "scene" ? (payload.sceneId || null) : null;
+    let actor = null;
+    try { actor = await this.resolveActorDocument(payload.actorUuid || payload.actorId); } catch (_err) { actor = null; }
+
+    if (!actor || !this.userOwnsActor(game.user, actor) || !this.isNetrunner(actor)) {
+      return { ok: false, message: "The pushed breach could not verify an owned Netrunner Actor on this client." };
+    }
+
+    const puzzle = await this.getPuzzle(payload.puzzleId, { scope, sceneId });
+    if (!puzzle) {
+      return { ok: false, message: "The pushed Hexcode Breach is not available to this client." };
+    }
+
+    const app = await this.openPuzzle(puzzle.id, {
+      scope,
+      sceneId,
+      actor,
+      actorUuid: actor.uuid
+    });
+    if (!app) return { ok: false, message: "The pushed Hexcode Breach could not be opened." };
+
+    ui.notifications.info(`Hexcode Breach received from ${sender.name || "GM"}: ${puzzle.name}`);
+    return { ok: true, message: `Opened ${puzzle.name} for ${actor.name}.` };
+  },
+
+  openPushDialog(options = {}) {
+    if (!game.user.isGM) return ui.notifications.warn("Only the GM can push Hexcode Breach puzzles to players.");
+    return new HBLPushPlayerApp(options).render(true);
+  },
+
+  async createPushMacro() {
+    if (!game.user.isGM) return ui.notifications.warn("Only the GM can create the Hexcode Breach push macro.");
+    const name = "Hexcode Breach — Push to Player";
+    const command = `const hbl = game.modules.get("hexcode-breach-lite")?.api;
+if (!hbl) return ui.notifications.error("Hexcode Breach Lite API is not available. Confirm the module is enabled, then restart Foundry.");
+if (!game.user.isGM) return ui.notifications.warn("Only the GM can push Hexcode Breach puzzles to players.");
+return hbl.openPushDialog();`;
+    let macro = game.macros.getName(name);
+    try {
+      if (macro) {
+        await macro.update({ type: "script", command, img: "systems/cyberpunk-red-core/icons/compendium/gear/computer.svg" });
+        ui.notifications.info("Updated the Hexcode Breach Push to Player macro.");
+      } else {
+        macro = await Macro.create({
+          name,
+          type: "script",
+          command,
+          img: "systems/cyberpunk-red-core/icons/compendium/gear/computer.svg"
+        });
+        ui.notifications.info("Created the Hexcode Breach Push to Player macro.");
+      }
+      return macro;
+    } catch (err) {
+      console.error(`${HBL_ID} | Failed to create/update Push to Player Macro`, err);
+      ui.notifications.error("Foundry could not create the Hexcode Breach Push to Player macro.");
+      return null;
+    }
   },
 
   async getRewardClaims() {
@@ -1474,6 +1654,10 @@ return hbl.openBound({
     bindSelectedTiles: async puzzle => HBL.bindSelectedTiles(puzzle),
     unbindSelectedTiles: async () => HBL.unbindSelectedTiles(),
     createHelperMacro: async () => HBL.createHelperMacro(),
+    createPushMacro: async () => HBL.createPushMacro(),
+    openPushDialog: (options = {}) => HBL.openPushDialog(options),
+    pushPuzzleToUser: async options => HBL.pushPuzzleToUser(options),
+    getPushTargets: (sceneRef = null) => HBL.getPushTargets(sceneRef),
     createRandom: async (scope = "scene") => HBL.savePuzzle(HBL.normalizePuzzle({ ...HBL.defaultPuzzle(), storageScope: scope }), { scope }),
     listScenePuzzles: async () => HBL.getScenePuzzles(),
     listWorldPuzzles: async () => HBL.getWorldPuzzles(),
@@ -1481,6 +1665,94 @@ return hbl.openBound({
     isNetrunner: actor => HBL.isNetrunner(actor)
   }
 };
+
+class HBLPushPlayerApp extends Application {
+  constructor(options = {}) {
+    super(options);
+    this.puzzleId = options.puzzleId ?? null;
+    this.puzzleScope = options.puzzleScope ? HBL.normalizeStorageScope(options.puzzleScope) : null;
+    this.sceneId = options.sceneId ?? HBL.getScene()?.id ?? null;
+    this.lockPuzzle = Boolean(options.lockPuzzle && this.puzzleId);
+    this.targets = [];
+  }
+
+  static get defaultOptions() {
+    return foundry.utils.mergeObject(super.defaultOptions, {
+      id: "hbl-push-player",
+      title: "Hexcode Breach Lite — Push to Player",
+      template: `modules/${HBL_ID}/templates/push-player.hbs`,
+      width: 560,
+      height: "auto",
+      resizable: true,
+      classes: ["hbl", "hbl-push-player"]
+    });
+  }
+
+  async getData() {
+    const scenePuzzles = await HBL.getScenePuzzles(this.sceneId);
+    const worldPuzzles = await HBL.getWorldPuzzles();
+    const puzzleOptions = [
+      ...Object.values(scenePuzzles).map(puzzle => ({
+        id: puzzle.id,
+        name: puzzle.name,
+        scope: "scene",
+        scopeLabel: "SCENE",
+        key: `scene::${puzzle.id}`
+      })),
+      ...Object.values(worldPuzzles).map(puzzle => ({
+        id: puzzle.id,
+        name: puzzle.name,
+        scope: "world",
+        scopeLabel: "PORTABLE",
+        key: `world::${puzzle.id}`
+      }))
+    ].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    let selectedKey = this.puzzleId ? `${this.puzzleScope || "scene"}::${this.puzzleId}` : "";
+    if (!puzzleOptions.some(option => option.key === selectedKey)) selectedKey = puzzleOptions[0]?.key || "";
+    for (const option of puzzleOptions) option.selected = option.key === selectedKey;
+
+    this.targets = HBL.getPushTargets(this.sceneId);
+    const selectedPuzzle = puzzleOptions.find(option => option.key === selectedKey) ?? null;
+
+    return {
+      puzzleOptions,
+      selectedPuzzle,
+      lockPuzzle: this.lockPuzzle,
+      targets: this.targets,
+      hasTargets: this.targets.length > 0,
+      hasPuzzles: puzzleOptions.length > 0,
+      sceneName: HBL.resolveScene(this.sceneId)?.name ?? HBL.getScene()?.name ?? "No Active Scene"
+    };
+  }
+
+  activateListeners(html) {
+    super.activateListeners(html);
+    html.find("[data-action='cancel']").on("click", () => this.close());
+    html.find("[data-action='push']").on("click", async () => {
+      const form = hblGetForm(html);
+      if (!form) return ui.notifications.error("Hexcode Breach push form could not be found.");
+      const puzzleKey = String(form.querySelector("[name='puzzleKey']")?.value || "");
+      const targetKey = String(form.querySelector("[name='targetKey']")?.value || "");
+      const [scope, puzzleId] = puzzleKey.split("::", 2);
+      const target = this.targets.find(entry => entry.key === targetKey);
+      if (!puzzleId) return ui.notifications.warn("Choose a saved Hexcode Breach puzzle.");
+      if (!target) return ui.notifications.warn("Choose an online player with an owned Netrunner.");
+
+      const result = await HBL.pushPuzzleToUser({
+        puzzleId,
+        puzzleScope: scope,
+        sceneId: this.sceneId,
+        targetUserId: target.userId,
+        actorUuid: target.actorUuid,
+        actorId: target.actorId
+      });
+      if (!result?.ok) return ui.notifications.warn(result?.message || "The Hexcode Breach push was not acknowledged.");
+      ui.notifications.info(`${target.userName} acknowledged the breach push. ${result.message || ""}`.trim());
+      await this.close();
+    });
+  }
+}
 
 class HBLDocumentPickerApp extends Application {
   constructor(options = {}) {
@@ -1850,6 +2122,18 @@ class HBLGMConfigApp extends Application {
     });
 
     html.find("[data-action='create-helper']").on("click", async () => HBL.createHelperMacro());
+    html.find("[data-action='create-push-helper']").on("click", async () => HBL.createPushMacro());
+    html.find("[data-action='push-player']").on("click", async () => {
+      if (!this._updatePuzzleFromForm(html)) return;
+      const saved = await this.saveCurrentPuzzle();
+      if (!saved?.id) return;
+      HBL.openPushDialog({
+        puzzleId: saved.id,
+        puzzleScope: saved.storageScope,
+        sceneId: HBL.getScene()?.id ?? null,
+        lockPuzzle: true
+      });
+    });
     html.find("[data-action='reset-rewards']").on("click", async () => this.resetRewardClaims());
     html.find("[data-action='delete']").on("click", async () => this.deleteCurrentPuzzle());
 
@@ -2476,6 +2760,28 @@ Hooks.once("ready", () => {
   game.socket.on(HBL_SOCKET, async message => {
     if (!message || typeof message !== "object") return;
 
+    if (message.type === "push-puzzle-response" && message.targetUserId === game.user.id) {
+      const pending = HBL.pendingPushRequests.get(message.requestId);
+      if (!pending) return;
+      window.clearTimeout(pending.timeout);
+      HBL.pendingPushRequests.delete(message.requestId);
+      pending.resolve(message.result || { ok: false, message: "The pushed breach was not acknowledged." });
+      return;
+    }
+
+    if (message.type === "push-puzzle-request" && message.targetUserId === game.user.id) {
+      const result = await HBL.processPushPuzzleRequest(message);
+      if (!result) return;
+      game.socket.emit(HBL_SOCKET, {
+        type: "push-puzzle-response",
+        requestId: message.requestId,
+        senderId: game.user.id,
+        targetUserId: message.senderId,
+        result
+      });
+      return;
+    }
+
     if (message.type === "reward-response" && message.targetUserId === game.user.id) {
       const pending = HBL.pendingRewardRequests.get(message.requestId);
       if (!pending) return;
@@ -2496,7 +2802,7 @@ Hooks.once("ready", () => {
     }
   });
 
-  console.log(`${HBL_ID} | Ready. API: HexcodeBreachLite.openGM(), HexcodeBreachLite.openPuzzle(id), game.hexcodebreach(context)`);
+  console.log(`${HBL_ID} | Ready. API: HexcodeBreachLite.openGM(), HexcodeBreachLite.openPuzzle(id), HexcodeBreachLite.openPushDialog(), game.hexcodebreach(context)`);
 });
 
 Hooks.on("getSceneControlButtons", controls => {
