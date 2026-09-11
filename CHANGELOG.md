@@ -1,11 +1,24 @@
 # Changelog
 
+## 1.2.1 — stable — 2026-09-10
+
+Dependency-free GM push workflow; no breach-engine changes. Promoted after live GM/player validation.
+
+- Added **Save + Push to Player** to GM Config. The loaded puzzle is saved, then the GM chooses an eligible online player/Netrunner and Hexcode opens the normal live breach UI directly on that player's client.
+- Added a generated universal **Hexcode Breach — Push to Player** Script Macro. It opens a selector for any saved Scene-local or Portable puzzle plus an eligible online target; no puzzle ID is hard-coded into the Macro.
+- Push targeting only includes active non-GM users and eligible Netrunner Actors they own. Current-scene owned Netrunner tokens are preferred, then the player's assigned character; owned world Netrunners are only scanned as a fallback to avoid an unnecessarily long selector.
+- Added a native package-socket push request/acknowledgement path. The receiving client re-validates the sending GM, Actor ownership, Netrunner role, puzzle scope, and puzzle existence before opening.
+- Scene-local pushes carry the source Scene ID so the recipient does not need to be viewing the same canvas for puzzle lookup. Existing `openPuzzle()` calls remain unchanged unless a `sceneId` is explicitly supplied.
+- Monk's Active Tile Triggers remains **recommended**, not required. Existing bound-Tile helper behavior is unchanged.
+- Preserved v1.2.0 matrix generation, overlapping-sequence handling, hard Buffer capacity, Emergency Reset, rewards, serialized one-time claims, Portable storage, Tile bindings, and `closeHBLPlayerApp` outcome metadata without migration.
+- Live dependency audit recorded for recommended Monk's Active Tile Triggers: minimum `12.01`, verified `12.02`, maximum `12.02`.
+
 ## 1.2.0 — 2026-09-06
 
 Overlapping-sequence and solvability hardening after live testing and audit.
 
 - **Overlapping sequences resolve in one legal buffer, like Cyberpunk 2077.** A walk such as `1C-55-1C` cracks both `1C-55` and `55-1C` in the same breach. Sequence matching remains synchronous and supports shared hexes naturally.
-- Restored the **Buffer filled** hard stop from v1.1.0 (deprecated hotfix designated v1.1.1). The configured 4–14 slots are again a real gameplay capacity rather than a sliding display window.
+- Restored the **Buffer filled** hard stop from v1.1.0. The configured 4–14 slots are again a real gameplay capacity rather than a sliding display window.
 - Reworked live-attempt matrix generation to be **buffer-aware**. For normal puzzle sizes, Hexcode computes an exact shortest overlap cover and embeds a legal route only within the configured buffer. If all sequences cannot fit together, the best planned partial route is embedded instead of granting extra inputs.
 - Replaced the randomized 64-retry snake finder with deterministic legal-route backtracking, then randomizes its row/column placement. This removes the rare valid-route-but-generator-gave-up failure mode while keeping attempt layouts fresh.
 - Serialized GM-authoritative reward request processing. Multiple sequences that crack on the same click can no longer race the one-time reward claim ledger through concurrent read/modify/write cycles.
