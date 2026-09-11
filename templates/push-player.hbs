@@ -1,0 +1,53 @@
+<form class="hbl-wrap hbl-push-wrap">
+  <header class="hbl-header">
+    <div>
+      <h2>PUSH TO PLAYER</h2>
+      <p>Open a saved Hexcode Breach directly on an online player's client using Foundry's native module socket.</p>
+      <p class="hbl-scene-line"><i class="fas fa-map"></i> Source Scene: <b>{{sceneName}}</b></p>
+    </div>
+    <i class="fas fa-broadcast-tower hbl-push-icon"></i>
+  </header>
+
+  <section class="hbl-panel">
+    <label>Breach Puzzle</label>
+    {{#if hasPuzzles}}
+      {{#if lockPuzzle}}
+        <input type="hidden" name="puzzleKey" value="{{selectedPuzzle.key}}" />
+        <div class="hbl-push-readout"><b>[{{selectedPuzzle.scopeLabel}}]</b> {{selectedPuzzle.name}}</div>
+      {{else}}
+        <select name="puzzleKey">
+          {{#each puzzleOptions}}
+            <option value="{{this.key}}" {{#if this.selected}}selected{{/if}}>[{{this.scopeLabel}}] {{this.name}}</option>
+          {{/each}}
+        </select>
+      {{/if}}
+    {{else}}
+      <div class="hbl-push-empty">No saved Hexcode Breach puzzles are available.</div>
+    {{/if}}
+
+    <label class="hbl-push-target-label">Online Player / Owned Netrunner</label>
+    {{#if hasTargets}}
+      <select name="targetKey">
+        {{#each targets}}
+          <option value="{{this.key}}">{{this.label}}</option>
+        {{/each}}
+      </select>
+      <p class="hbl-help">Only active non-GM users are shown. Current-scene owned Netrunner tokens are preferred, then the player's assigned Netrunner, with owned world Netrunners used only as a fallback.</p>
+    {{else}}
+      <div class="hbl-push-empty">No online player currently has an eligible owned Netrunner Actor.</div>
+    {{/if}}
+  </section>
+
+  <section class="hbl-panel hbl-push-note">
+    <i class="fas fa-plug"></i>
+    <div>
+      <b>No Monk's dependency required.</b>
+      <p>The receiving client re-checks Actor ownership, Netrunner access, puzzle scope, and the sending GM before opening the normal live breach interface.</p>
+    </div>
+  </section>
+
+  <footer class="hbl-footer hbl-push-footer">
+    <button type="button" data-action="cancel"><i class="fas fa-times"></i> Cancel</button>
+    <button type="button" data-action="push" {{#unless hasPuzzles}}disabled{{/unless}} {{#unless hasTargets}}disabled{{/unless}}><i class="fas fa-broadcast-tower"></i> Push Breach</button>
+  </footer>
+</form>
