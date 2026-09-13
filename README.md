@@ -1,8 +1,8 @@
-# Hexcode-Breach-Lite
+# Hexcode-Breach-Lite for use with Cyberpunk RED
 
 A lightweight Cyberpunk-style breach-protocol minigame for **Foundry VTT v12** and the **Cyberpunk RED Core** system.
 
-Hexcode Breach Lite lets a GM build reusable breach puzzles, bind them to Tiles, restrict live access to Netrunners, and attach Eurobuck, Item, or RollTable rewards to individual sequences.
+Hexcode Breach Lite for use with Cyberpunk RED lets a GM build reusable breach puzzles, bind them to Tiles, restrict live access to Netrunners, and attach Eurobuck, Item, or RollTable rewards to individual sequences.
 
 > **v1.2.1 stable:** adds a Foundry-native **GM Push to Player** workflow and universal Push Macro so Hexcode Breach can be delivered directly to an online Netrunner without Monk's Active Tile Triggers. All v1.2.0 breach, buffer, matrix, reward, Portable, and close-hook behavior is otherwise unchanged.
 
@@ -220,6 +220,16 @@ Companion modules should ignore `gmPreview: true` for live unlocks.
 - **Tile bindings:** Tile flag `flags.hexcode-breach-lite.binding`
 
 Older bindings without an explicit scope are treated as **Scene-local**, so v1.0.5 worlds do not require a data migration.
+
+##  Legal / Homebrew Content Policy
+
+This is unofficial homebrew content for use with Cyberpunk RED.
+
+This project is provided free of charge under the R. Talsorian Games Homebrew Content Policy.
+
+Hexcode Breach Lite for use with Cyberpunk RED is unofficial content provided under the Homebrew Content Policy of R. Talsorian Games and is not approved or endorsed by RTG. This content references materials that are the property of R. Talsorian Games and its licensees.
+
+Cyberpunk RED and related properties are the property of R. Talsorian Games and their respective licensees.
 
 ## Credits
 
